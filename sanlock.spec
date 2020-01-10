@@ -1,6 +1,6 @@
 Name:           sanlock
 Version:        2.8
-Release:        2%{?dist}
+Release:        3%{?dist}
 Summary:        A shared disk lock manager
 
 Group:          System Environment/Base
@@ -10,6 +10,8 @@ BuildRoot:      %{_tmppath}/%{name}-%{version}-%{release}-root-%(%{__id_u} -n)
 ExclusiveArch:  x86_64
 BuildRequires:  libblkid-devel libaio-devel python python-devel
 Requires:       %{name}-lib = %{version}-%{release}
+Requires(pre):  /usr/sbin/groupadd
+Requires(pre):  /usr/sbin/useradd
 Source0:        https://fedorahosted.org/releases/s/a/sanlock/%{name}-%{version}.tar.gz
 
 Patch0: 0001-sanlock-fix-get_hosts-off-by-one.patch
@@ -253,8 +255,11 @@ if [ $1 -ge 1 ] ; then
 fi
 
 %changelog
-* Fri Dec 05 2014 David Teigland <teigland@redhat.com> - 2.8-2
-- Resolves: rhbz#1139373
+* Fri Jun 10 2016 David Teigland <teigland@redhat.com> - 2.8-3
+- Resolves: rhbz#1344139
+
+* Mon Sep 08 2014 David Teigland <teigland@redhat.com> - 2.8-2
+- Resolves: rhbz#1111210
 
 * Fri Jul 12 2013 David Teigland <teigland@redhat.com> - 2.8-1
 - Resolves: rhbz#960989 rhbz#960993 rhbz#961032 rhbz#966088
