@@ -1,6 +1,6 @@
 Name:           sanlock
 Version:        2.8
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        A shared disk lock manager
 
 Group:          System Environment/Base
@@ -12,6 +12,8 @@ BuildRequires:  libblkid-devel libaio-devel python python-devel
 Requires:       %{name}-lib = %{version}-%{release}
 Source0:        https://fedorahosted.org/releases/s/a/sanlock/%{name}-%{version}.tar.gz
 
+Patch0: 0001-sanlock-fix-get_hosts-off-by-one.patch
+
 %description
 sanlock uses disk paxos to manage leases on shared storage.
 Hosts connected to a common SAN can use this to synchronize their
@@ -19,6 +21,7 @@ access to the shared disks.
 
 %prep
 %setup -q
+%patch0 -p1 -b .0001-sanlock-fix-get_hosts-off-by-one.patch
 
 %build
 # upstream does not require configure
@@ -250,6 +253,9 @@ if [ $1 -ge 1 ] ; then
 fi
 
 %changelog
+* Fri Dec 05 2014 David Teigland <teigland@redhat.com> - 2.8-2
+- Resolves: rhbz#1139373
+
 * Fri Jul 12 2013 David Teigland <teigland@redhat.com> - 2.8-1
 - Resolves: rhbz#960989 rhbz#960993 rhbz#961032 rhbz#966088
 
