@@ -70,6 +70,117 @@ void send_state_resources(int fd)
 	pthread_mutex_unlock(&resource_mutex);
 }
 
+int read_resource_owners(struct task *task, struct token *token,
+			 struct sanlk_resource *res,
+			 char **send_buf, int *send_len, int *count)
+{
+	struct leader_record leader;
+	struct sync_disk *disk;
+	struct sanlk_host *host;
+	struct mode_block *mb;
+	uint64_t host_id;
+	char *dblock;
+	char *lease_buf = NULL;
+	char *hosts_buf = NULL;
+	int host_count = 0;
+	int i, rv;
+
+	disk = &token->disks[0];
+
+	/* we could in-line paxos_read_buf here like we do in read_mode_block */
+
+	rv = paxos_read_buf(task, token, &lease_buf);
+	if (rv < 0) {
+		log_errot(token, "read_resource_owners read_buf rv %d", rv);
+
+		if (lease_buf && (rv != SANLK_AIO_TIMEOUT))
+			free(lease_buf);
+		return rv;
+	}
+
+	memcpy(&leader, lease_buf, sizeof(struct leader_record));
+
+	rv = paxos_verify_leader(token, disk, &leader, "read_resource_owners");
+	if (rv < 0)
+		goto out;
+
+	res->lver = leader.lver;
+
+	if (leader.timestamp && leader.owner_id)
+		host_count++;
+
+	for (i = 0; i < leader.num_hosts; i++) {
+		dblock = lease_buf + ((2 + i) * disk->sector_size);
+		mb = (struct mode_block *)(dblock + MBLOCK_OFFSET);
+		host_id = i + 1;
+
+		if (!(mb->flags & MBLOCK_SHARED))
+			continue;
+
+		res->flags |= SANLK_RES_SHARED;
+
+		/* the leader owner has already been counted above;
+		   in the ex case it won't have a mode block set */
+
+		if (leader.timestamp && leader.owner_id && (host_id == leader.owner_id))
+			continue;
+
+		host_count++;
+	}
+
+	*count = host_count;
+
+	if (!host_count) {
+		rv = 0;
+		goto out;
+	}
+
+	hosts_buf = malloc(host_count * sizeof(struct sanlk_host));
+	if (!hosts_buf) {
+		host_count = 0;
+		rv = -ENOMEM;
+		goto out;
+	}
+	memset(hosts_buf, 0, host_count * sizeof(struct sanlk_host));
+	host = (struct sanlk_host *)hosts_buf;
+
+	/*
+	 * Usually when leader owner is set, it's an exclusive lock and
+	 * we could skip to the end, but if we read while a new shared
+	 * owner is being added, we'll see the leader owner set, and
+	 * then may see other shared owners in the mode blocks.
+	 */
+
+	if (leader.timestamp && leader.owner_id) {
+		host->host_id = leader.owner_id;
+		host->generation = leader.owner_generation;
+		host->timestamp = leader.timestamp;
+		host++;
+	}
+
+	for (i = 0; i < leader.num_hosts; i++) {
+		dblock = lease_buf + ((2 + i) * disk->sector_size);
+		mb = (struct mode_block *)(dblock + MBLOCK_OFFSET);
+		host_id = i + 1;
+
+		if (!(mb->flags & MBLOCK_SHARED))
+			continue;
+
+		if (leader.timestamp && leader.owner_id && (host_id == leader.owner_id))
+			continue;
+
+		host->host_id = host_id;
+		host->generation = mb->generation;
+		host++;
+	}
+	rv = 0;
+ out:
+	*send_len = host_count * sizeof(struct sanlk_host);
+	*send_buf = hosts_buf;
+	free(lease_buf);
+	return rv;
+}
+
 /* return 1 (is alive) to force a failure if we don't have enough
    knowledge to know it's really not alive.  Later we could have this sit and
    wait (like paxos_lease_acquire) until we have waited long enough or have
@@ -564,12 +675,15 @@ static struct resource *new_resource(struct token *token)
 		r->pid = token->pid;
 		if (token->flags & T_RESTRICT_SIGKILL)
 			r->flags |= R_RESTRICT_SIGKILL;
+		if (token->flags & T_RESTRICT_SIGTERM)
+			r->flags |= R_RESTRICT_SIGTERM;
 	}
 
 	return r;
 }
 
-int acquire_token(struct task *task, struct token *token)
+int acquire_token(struct task *task, struct token *token,
+		  char *killpath, char *killargs)
 {
 	struct leader_record leader;
 	struct resource *r;
@@ -626,6 +740,8 @@ int acquire_token(struct task *task, struct token *token)
 		return -ENOMEM;
 	}
 
+	memcpy(r->killpath, killpath, SANLK_HELPER_PATH_LEN);
+	memcpy(r->killargs, killargs, SANLK_HELPER_ARGS_LEN);
 	list_add(&token->list, &r->tokens);
 	list_add(&r->list, &resources_add);
 	token->resource = r;
@@ -712,7 +828,7 @@ int acquire_token(struct task *task, struct token *token)
 }
 
 int request_token(struct task *task, struct token *token, uint32_t force_mode,
-		  uint64_t *owner_id)
+		  uint64_t *owner_id, int next_lver)
 {
 	struct leader_record leader;
 	struct request_record req;
@@ -740,6 +856,9 @@ int request_token(struct task *task, struct token *token, uint32_t force_mode,
 	}
 
 	*owner_id = leader.owner_id;
+
+	if (!token->acquire_lver && next_lver)
+		token->acquire_lver = leader.lver + 1;
 
 	if (leader.lver >= token->acquire_lver) {
 		rv = SANLK_REQUEST_OLD;
@@ -820,6 +939,8 @@ static int examine_token(struct task *task, struct token *token,
 
 static void do_request(struct token *tt, int pid, uint32_t force_mode)
 {
+	char killpath[SANLK_HELPER_PATH_LEN];
+	char killargs[SANLK_HELPER_ARGS_LEN];
 	struct helper_msg hm;
 	struct resource *r;
 	uint32_t flags;
@@ -830,6 +951,8 @@ static void do_request(struct token *tt, int pid, uint32_t force_mode)
 	if (r && r->pid == pid) {
 		found = 1;
 		flags = r->flags;
+		memcpy(killpath, r->killpath, SANLK_HELPER_PATH_LEN);
+		memcpy(killargs, r->killargs, SANLK_HELPER_ARGS_LEN);
 	}
 	pthread_mutex_unlock(&resource_mutex);
 
@@ -849,32 +972,25 @@ static void do_request(struct token *tt, int pid, uint32_t force_mode)
 
 	memset(&hm, 0, sizeof(hm));
 
-	if (force_mode == SANLK_REQ_KILL_PID) {
+	if (force_mode == SANLK_REQ_FORCE) {
 		hm.type = HELPER_MSG_KILLPID;
 		hm.pid = pid;
 		hm.sig = (flags & R_RESTRICT_SIGKILL) ? SIGTERM : SIGKILL;
-	} else if (force_mode == SANLK_REQ_SIGUSR1) {
-		hm.type = HELPER_MSG_KILLPID;
-		hm.pid = pid;
-		hm.sig = SIGUSR1;
+	} else if (force_mode == SANLK_REQ_GRACEFUL) {
+		if (killpath[0]) {
+			hm.type = HELPER_MSG_RUNPATH;
+			memcpy(hm.path, killpath, SANLK_HELPER_PATH_LEN);
+			memcpy(hm.args, killargs, SANLK_HELPER_ARGS_LEN);
+		} else {
+			hm.type = HELPER_MSG_KILLPID;
+			hm.pid = pid;
+			hm.sig = (flags & R_RESTRICT_SIGTERM) ? SIGKILL : SIGTERM;
+		}
 	} else {
 		log_error("do_request %d unknown force_mode %d",
 			  pid, force_mode);
 		return;
 	}
-#if 0
-	/* TODO: this is difficult because we can't dig into the clients
-	   array to get the killpath/killargs; the clients array is not
-	   locked and can only be accessed by the main thread. */
-
-	else if (force_mode == SANLK_REQ_KILLPATH) {
-		hm.type = HELPER_MSG_RUNPATH;
-		memcpy(hm.path, cl->killpath, SANLK_HELPER_PATH_LEN);
-		memcpy(hm.args, cl->killargs, SANLK_HELPER_ARGS_LEN);
-		if (cl->flags & CL_KILLPATH_PID)
-			hm.pid = pid;
-	}
-#endif
 
  retry:
 	rv = write(helper_kill_fd, &hm, sizeof(hm));

@@ -1,6 +1,6 @@
 Name:           sanlock
-Version:        2.6
-Release:        2%{?dist}
+Version:        2.8
+Release:        1%{?dist}
 Summary:        A shared disk lock manager
 
 Group:          System Environment/Base
@@ -60,10 +60,10 @@ install -D -m 755 init.d/fence_sanlockd $RPM_BUILD_ROOT/%{_initddir}/fence_sanlo
 install -Dm 0644 src/logrotate.sanlock \
 	$RPM_BUILD_ROOT/etc/logrotate.d/sanlock
 
-install -Dm 0644 src/sysconfig.sanlock \
+install -Dm 0644 init.d/sanlock.sysconfig \
 	$RPM_BUILD_ROOT/etc/sysconfig/sanlock
 
-install -Dm 0644 wdmd/sysconfig.wdmd \
+install -Dm 0644 init.d/wdmd.sysconfig \
 	$RPM_BUILD_ROOT/etc/sysconfig/wdmd
 
 install -dm 0755 $RPM_BUILD_ROOT/etc/wdmd.d
@@ -250,6 +250,9 @@ if [ $1 -ge 1 ] ; then
 fi
 
 %changelog
+* Fri Jul 12 2013 David Teigland <teigland@redhat.com> - 2.8-1
+- Resolves: rhbz#960989 rhbz#960993 rhbz#961032 rhbz#966088
+
 * Tue Oct 09 2012 David Teigland <teigland@redhat.com> - 2.6-1
 - Resolves: rhbz#858964 rhbz#843073
 

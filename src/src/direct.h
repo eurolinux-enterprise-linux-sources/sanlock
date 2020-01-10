@@ -30,25 +30,15 @@ int direct_release_id(struct task *task, int io_timeout,
 int direct_renew_id(struct task *task, int io_timeout,
 		    struct sanlk_lockspace *ls);
 
-int direct_read_id(struct task *task, int io_timeout,
-                   struct sanlk_lockspace *ls,
-                   uint64_t *timestamp,
-                   uint64_t *owner_id,
-                   uint64_t *owner_generation);
-
-int direct_live_id(struct task *task, int io_timeout,
-                   struct sanlk_lockspace *ls,
-                   uint64_t *timestamp,
-                   uint64_t *owner_id,
-                   uint64_t *owner_generation,
-                   int *live);
-
 int direct_align(struct sync_disk *disk);
 
-int direct_init(struct task *task, int io_timeout,
-                struct sanlk_lockspace *ls,
-                struct sanlk_resource *res,
-                int max_hosts, int num_hosts);
+/* io_timeout is written in the leader record and used for the
+   write call itself */
+int direct_write_lockspace(struct task *task, struct sanlk_lockspace *ls,
+			   int max_hosts, uint32_t io_timeout);
+
+int direct_write_resource(struct task *task, struct sanlk_resource *res,
+			  int max_hosts, int num_hosts);
 
 int direct_read_leader(struct task *task, int io_timeout,
                        struct sanlk_lockspace *ls,

@@ -103,7 +103,7 @@ static void run_path(struct helper_msg *hm)
 		av[av_count++] = strdup(arg);
 	}
 
-	execv(av[0], av);
+	execvp(av[0], av);
 }
 
 static int read_hm(int fd, struct helper_msg *hm)
@@ -151,7 +151,7 @@ int run_helper(int in_fd, int out_fd, int log_stderr)
 	struct helper_msg hm;
 	unsigned int fork_count = 0;
 	unsigned int wait_count = 0;
-	time_t now, last_send, last_good;
+	time_t now, last_send, last_good = 0;
 	int timeout = STANDARD_TIMEOUT_MS;
 	int rv, pid, status;
 

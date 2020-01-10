@@ -54,6 +54,8 @@
 #include "helper.h"
 #include "timeouts.h"
 
+#define ONEMB 1048576
+
 #define SIGRUNPATH 100 /* anything that's not SIGTERM/SIGKILL */
 
 struct thread_pool {
@@ -520,7 +522,7 @@ void client_pid_dead(int ci)
    lock both spaces_mutex and cl->mutex when adding new tokens to the client.
    (It needs to check that the lockspace for the new tokens hasn't failed
    while the tokens were being acquired.)
-   
+
    In kill_pids and all_pids_dead could we check cl->pid <= 0 without
    taking cl->mutex, since client_pid_dead in the main thread is the
    only place that changes that?  */
@@ -551,7 +553,7 @@ static void kill_pids(struct space *sp)
 	struct client *cl;
 	uint64_t now, last_success;
 	int id_renewal_fail_seconds;
-	int ci, fd, pid, sig;
+	int ci, sig;
 	int do_kill, in_grace;
 
 	/*
@@ -603,9 +605,6 @@ static void kill_pids(struct space *sp)
 		cl->kill_last = now;
 		cl->kill_count++;
 
-		fd = cl->fd;
-		pid = cl->pid;
-
 		/*
 		 * the transition from using killpath/sigterm to sigkill
 		 * is when now >=
@@ -616,7 +615,9 @@ static void kill_pids(struct space *sp)
 
 		in_grace = now < (last_success + id_renewal_fail_seconds + kill_grace_seconds);
 
-		if ((kill_grace_seconds > 0) && in_grace && cl->killpath[0]) {
+		if (sp->external_remove || (external_shutdown > 1)) {
+			sig = SIGKILL;
+		} else if ((kill_grace_seconds > 0) && in_grace && cl->killpath[0]) {
 			sig = SIGRUNPATH;
 		} else if (in_grace) {
 			sig = SIGTERM;
@@ -1151,6 +1152,8 @@ static void process_connection(int ci)
 	case SM_CMD_STATUS:
 	case SM_CMD_HOST_STATUS:
 	case SM_CMD_LOG_DUMP:
+	case SM_CMD_GET_LOCKSPACES:
+	case SM_CMD_GET_HOSTS:
 		call_cmd_daemon(ci, &h, client_maxi);
 		break;
 	case SM_CMD_ADD_LOCKSPACE:
@@ -1160,8 +1163,11 @@ static void process_connection(int ci)
 	case SM_CMD_EXAMINE_RESOURCE:
 	case SM_CMD_EXAMINE_LOCKSPACE:
 	case SM_CMD_ALIGN:
-	case SM_CMD_INIT_LOCKSPACE:
-	case SM_CMD_INIT_RESOURCE:
+	case SM_CMD_WRITE_LOCKSPACE:
+	case SM_CMD_WRITE_RESOURCE:
+	case SM_CMD_READ_LOCKSPACE:
+	case SM_CMD_READ_RESOURCE:
+	case SM_CMD_READ_RESOURCE_OWNERS:
 		rv = client_suspend(ci);
 		if (rv < 0)
 			return;
@@ -1613,22 +1619,24 @@ static int do_daemon(void)
 
 	sprintf(main_task.name, "%s", "main");
 	setup_task_aio(&main_task, com.aio_arg, 0);
-	 
+
 	rv = client_alloc();
 	if (rv < 0)
 		return rv;
 
 	helper_ci = client_add(helper_status_fd, process_helper, helper_dead);
 	if (helper_ci < 0)
-		goto out_logging;
+		return rv;
 	strcpy(client[helper_ci].owner_name, "helper");
 
 	setup_signals();
 	setup_logging();
 
 	fd = lockfile(SANLK_RUN_DIR, SANLK_LOCKFILE_NAME, com.uid, com.gid);
-	if (fd < 0)
+	if (fd < 0) {
+		close_logging();
 		return fd;
+	}
 
 	setup_host_name();
 
@@ -1641,7 +1649,7 @@ static int do_daemon(void)
 
 	rv = thread_pool_create(DEFAULT_MIN_WORKER_THREADS, com.max_worker_threads);
 	if (rv < 0)
-		goto out_logging;
+		goto out;
 
 	rv = setup_listener();
 	if (rv < 0)
@@ -1657,7 +1665,8 @@ static int do_daemon(void)
 
  out_threads:
 	thread_pool_free();
- out_logging:
+ out:
+	/* order reversed from setup so lockfile is last */
 	close_logging();
 	unlink_lockfile(fd, SANLK_RUN_DIR, SANLK_LOCKFILE_NAME);
 	return rv;
@@ -1733,7 +1742,7 @@ static int parse_arg_resource(char *arg)
 	return 0;
 }
 
-/* 
+/*
  * daemon: acquires leases for the local host_id, associates them with a local
  * pid, and releases them when the associated pid exits.
  *
@@ -1759,7 +1768,7 @@ static void print_usage(void)
 	printf("  -D            no fork and print all logging to stderr\n");
 	printf("  -Q 0|1        quiet error messages for common lock contention (0)\n");
 	printf("  -R 0|1        renewal debugging, log debug info about renewals (0)\n");
-	printf("  -L <pri>      write logging at priority level and up to logfile (3 LOG_ERR))\n");
+	printf("  -L <pri>      write logging at priority level and up to logfile (3 LOG_ERR)\n");
 	printf("                (use -1 for none)\n");
 	printf("  -S <pri>      write logging at priority level and up to syslog (3 LOG_ERR)\n");
 	printf("                (use -1 for none)\n");
@@ -1769,16 +1778,18 @@ static void print_usage(void)
 	printf("  -g <sec>      seconds for graceful recovery (%d)\n", DEFAULT_GRACE_SEC);
 	printf("  -w 0|1        use watchdog through wdmd (%d)\n", DEFAULT_USE_WATCHDOG);
 	printf("  -h 0|1        use high priority (RR) scheduling (%d)\n", DEFAULT_HIGH_PRIORITY);
-	printf("  -l <num>      use mlockall (0 none, 1 current, 2 current and future) (2)\n");
+	printf("  -l <num>      use mlockall (0 none, 1 current, 2 current and future) (%d)\n", DEFAULT_MLOCK_LEVEL);
 	printf("  -a 0|1        use async io (%d)\n", DEFAULT_USE_AIO);
 	printf("  -o 0|1        io timeout in seconds (%d)\n", DEFAULT_IO_TIMEOUT);
 	printf("\n");
 	printf("sanlock client <action> [options]\n");
 	printf("sanlock client status [-D] [-o p|s]\n");
+	printf("sanlock client gets [-h 0|1]\n");
 	printf("sanlock client host_status -s LOCKSPACE [-D]\n");
 	printf("sanlock client log_dump\n");
 	printf("sanlock client shutdown [-f 0|1]\n");
 	printf("sanlock client init -s LOCKSPACE | -r RESOURCE\n");
+	printf("sanlock client read -s LOCKSPACE | -r RESOURCE\n");
 	printf("sanlock client align -s LOCKSPACE\n");
 	printf("sanlock client add_lockspace -s LOCKSPACE\n");
 	printf("sanlock client inq_lockspace -s LOCKSPACE\n");
@@ -1793,8 +1804,6 @@ static void print_usage(void)
 	printf("sanlock direct <action> [-a 0|1] [-o 0|1]\n");
 	printf("sanlock direct init -s LOCKSPACE | -r RESOURCE\n");
 	printf("sanlock direct read_leader -s LOCKSPACE | -r RESOURCE\n");
-	printf("sanlock direct read_id -s LOCKSPACE\n");
-	printf("sanlock direct live_id -s LOCKSPACE\n");
 	printf("sanlock direct dump <path>[:<offset>]\n");
 	printf("\n");
 	printf("LOCKSPACE = <lockspace_name>:<host_id>:<path>:<offset>\n");
@@ -1876,6 +1885,8 @@ static int read_command_line(int argc, char *argv[])
 			com.action = ACT_STATUS;
 		else if (!strcmp(act, "host_status"))
 			com.action = ACT_HOST_STATUS;
+		else if (!strcmp(act, "gets"))
+			com.action = ACT_GETS;
 		else if (!strcmp(act, "log_dump"))
 			com.action = ACT_LOG_DUMP;
 		else if (!strcmp(act, "shutdown"))
@@ -1902,6 +1913,10 @@ static int read_command_line(int argc, char *argv[])
 			com.action = ACT_CLIENT_ALIGN;
 		else if (!strcmp(act, "init"))
 			com.action = ACT_CLIENT_INIT;
+		else if (!strcmp(act, "write"))
+			com.action = ACT_CLIENT_INIT;
+		else if (!strcmp(act, "read"))
+			com.action = ACT_CLIENT_READ;
 		else {
 			log_tool("client action \"%s\" is unknown", act);
 			exit(EXIT_FAILURE);
@@ -1927,10 +1942,6 @@ static int read_command_line(int argc, char *argv[])
 			com.action = ACT_RELEASE_ID;
 		else if (!strcmp(act, "renew_id"))
 			com.action = ACT_RENEW_ID;
-		else if (!strcmp(act, "read_id"))
-			com.action = ACT_READ_ID;
-		else if (!strcmp(act, "live_id"))
-			com.action = ACT_LIVE_ID;
 		else {
 			log_tool("direct action \"%s\" is unknown", act);
 			exit(EXIT_FAILURE);
@@ -2000,7 +2011,10 @@ static int read_command_line(int argc, char *argv[])
 			com.use_watchdog = atoi(optionarg);
 			break;
 		case 'h':
-			com.high_priority = atoi(optionarg);
+			if (com.action == ACT_GETS || com.action == ACT_CLIENT_READ)
+				com.get_hosts = atoi(optionarg);
+			else
+				com.high_priority = atoi(optionarg);
 			break;
 		case 'l':
 			com.mlock_level = atoi(optionarg);
@@ -2112,12 +2126,176 @@ static int read_command_line(int argc, char *argv[])
 	return 0;
 }
 
+/* only used by do_client */
+static char *lsf_to_str(uint32_t flags)
+{
+	static char lsf_str[16];
+
+	memset(lsf_str, 0, 16);
+
+	if (flags & SANLK_LSF_ADD)
+		strcat(lsf_str, "ADD ");
+
+	if (flags & SANLK_LSF_REM)
+		strcat(lsf_str, "REM ");
+
+	return lsf_str;
+}
+
+static const char *host_state_str(uint32_t flags)
+{
+	int val = flags & SANLK_HOST_MASK;
+
+	if (val == SANLK_HOST_FREE)
+		return "FREE";
+	if (val == SANLK_HOST_LIVE)
+		return "LIVE";
+	if (val == SANLK_HOST_FAIL)
+		return "FAIL";
+	if (val == SANLK_HOST_DEAD)
+		return "DEAD";
+	if (val == SANLK_HOST_UNKNOWN)
+		return "UNKNOWN";
+	return "ERROR";
+}
+
+static int do_client_gets(void)
+{
+	struct sanlk_lockspace *lss = NULL, *ls;
+	struct sanlk_host *hss = NULL, *hs;
+	int ls_count = 0, hss_count = 0;
+	int i, j, rv;
+
+	rv = sanlock_get_lockspaces(&lss, &ls_count, 0);
+	if (rv < 0)
+		log_tool("gets error %d", rv);
+
+	if (rv < 0 && rv != -ENOSPC) {
+		if (lss)
+			free(lss);
+		return rv;
+	}
+
+	if (!lss)
+		return 0;
+
+	ls = lss;
+
+	for (i = 0; i < ls_count; i++) {
+		log_tool("s %.48s:%llu:%s:%llu %s",
+			 ls->name,
+			 (unsigned long long)ls->host_id,
+			 ls->host_id_disk.path,
+			 (unsigned long long)ls->host_id_disk.offset,
+			 !ls->flags ? "" : lsf_to_str(ls->flags));
+
+		if (!com.get_hosts)
+			goto next;
+
+		rv = sanlock_get_hosts(ls->name, 0, &hss, &hss_count, 0);
+		if (rv == -EAGAIN) {
+			log_tool("hosts not ready");
+			goto next;
+		}
+		if (rv < 0) {
+			log_tool("hosts error %d", rv);
+			goto next;
+		}
+
+		if (!hss)
+			goto next;
+
+		hs = hss;
+
+		for (j = 0; j < hss_count; j++) {
+			log_tool("h %llu gen %llu timestamp %llu %s",
+				 (unsigned long long)hs->host_id,
+				 (unsigned long long)hs->generation,
+				 (unsigned long long)hs->timestamp,
+				 host_state_str(hs->flags));
+			hs++;
+		}
+		free(hss);
+ next:
+		ls++;
+	}
+
+	free(lss);
+	return 0;
+}
+
+static int do_client_read(void)
+{
+	struct sanlk_host *hss = NULL, *hs;
+	char *res_str = NULL;
+	uint32_t io_timeout = 0;
+	int rv, i, hss_count = 0;
+
+	if (com.lockspace.host_id_disk.path[0]) {
+		rv = sanlock_read_lockspace(&com.lockspace, 0, &io_timeout);
+	} else {
+		if (!com.get_hosts) {
+			rv = sanlock_read_resource(com.res_args[0], 0);
+		} else {
+			rv = sanlock_read_resource_owners(com.res_args[0], 0,
+							  &hss, &hss_count);
+		}
+	}
+
+	if (rv < 0) {
+		log_tool("read error %d", rv);
+		goto out;
+	}
+
+	if (com.lockspace.host_id_disk.path[0]) {
+		log_tool("s %.48s:%llu:%s:%llu",
+			 com.lockspace.name,
+			 (unsigned long long)com.lockspace.host_id,
+			 com.lockspace.host_id_disk.path,
+			 (unsigned long long)com.lockspace.host_id_disk.offset);
+		log_tool("io_timeout %u", io_timeout);
+		goto out;
+	}
+
+	rv = sanlock_res_to_str(com.res_args[0], &res_str);
+	if (rv < 0) {
+		log_tool("res_to_str error %d", rv);
+		goto out;
+	}
+
+	log_tool("r %s", res_str);
+
+	free(res_str);
+
+	if (!hss)
+		goto out;
+
+	hs = hss;
+
+	for (i = 0; i < hss_count; i++) {
+		if (hs->timestamp)
+			log_tool("h %llu gen %llu timestamp %llu",
+				 (unsigned long long)hs->host_id,
+				 (unsigned long long)hs->generation,
+				 (unsigned long long)hs->timestamp);
+		else
+			log_tool("h %llu gen %llu",
+				 (unsigned long long)hs->host_id,
+				 (unsigned long long)hs->generation);
+		hs++;
+	}
+	free(hss);
+ out:
+	return rv;
+}
+
 static int do_client(void)
 {
 	struct sanlk_resource **res_args = NULL;
 	struct sanlk_resource *res;
 	char *res_state = NULL;
-	int i, fd, rv = 0;
+	int i, fd;
+	int rv = 0;
 
 	if (com.action == ACT_COMMAND || com.action == ACT_ACQUIRE) {
 		if (com.num_hosts) {
@@ -2136,6 +2314,10 @@ static int do_client(void)
 
 	case ACT_HOST_STATUS:
 		rv = sanlock_host_status(com.debug, com.lockspace.name);
+		break;
+
+	case ACT_GETS:
+		rv = do_client_gets();
 		break;
 
 	case ACT_LOG_DUMP:
@@ -2271,12 +2453,18 @@ static int do_client(void)
 	case ACT_CLIENT_INIT:
 		log_tool("init");
 		if (com.lockspace.host_id_disk.path[0])
-			rv = sanlock_init(&com.lockspace, NULL,
-					  com.max_hosts, com.num_hosts);
+			rv = sanlock_write_lockspace(&com.lockspace,
+						     com.max_hosts, 0,
+						     com.io_timeout_arg);
 		else
-			rv = sanlock_init(NULL, com.res_args[0],
-					  com.max_hosts, com.num_hosts);
+			rv = sanlock_write_resource(com.res_args[0],
+						    com.max_hosts,
+						    com.num_hosts, 0);
 		log_tool("init done %d", rv);
+		break;
+
+	case ACT_CLIENT_READ:
+		rv = do_client_read();
 		break;
 
 	default:
@@ -2290,8 +2478,6 @@ static int do_client(void)
 static int do_direct(void)
 {
 	struct leader_record leader;
-	uint64_t timestamp, owner_id, owner_generation;
-	int live;
 	int rv;
 
 	setup_task_aio(&main_task, com.aio_arg, DIRECT_AIO_CB_SIZE);
@@ -2299,8 +2485,12 @@ static int do_direct(void)
 
 	switch (com.action) {
 	case ACT_DIRECT_INIT:
-		rv = direct_init(&main_task, com.io_timeout_arg, &com.lockspace,
-				 com.res_args[0], com.max_hosts, com.num_hosts);
+		if (com.lockspace.host_id_disk.path[0])
+			rv = direct_write_lockspace(&main_task, &com.lockspace,
+						    com.max_hosts, com.io_timeout_arg);
+		else
+			rv = direct_write_resource(&main_task, com.res_args[0],
+						   com.max_hosts, com.num_hosts);
 		log_tool("init done %d", rv);
 		break;
 
@@ -2377,37 +2567,6 @@ static int do_direct(void)
 		log_tool("rewew_id done %d", rv);
 		break;
 
-	case ACT_READ_ID:
-		rv = direct_read_id(&main_task,
-				    com.io_timeout_arg,
-				    &com.lockspace,
-				    &timestamp,
-				    &owner_id,
-				    &owner_generation);
-
-		log_tool("read_id done %d timestamp %llu owner_id %llu owner_generation %llu",
-			 rv,
-			 (unsigned long long)timestamp,
-			 (unsigned long long)owner_id,
-			 (unsigned long long)owner_generation);
-		break;
-
-	case ACT_LIVE_ID:
-		rv = direct_live_id(&main_task,
-				    com.io_timeout_arg,
-				    &com.lockspace,
-				    &timestamp,
-				    &owner_id,
-				    &owner_generation,
-				    &live);
-
-		log_tool("live_id done %d live %d timestamp %llu owner_id %llu owner_generation %llu",
-			 rv, live,
-			 (unsigned long long)timestamp,
-			 (unsigned long long)owner_id,
-			 (unsigned long long)owner_generation);
-		break;
-
 	default:
 		log_tool("direct action %d not known", com.action);
 		rv = -1;
@@ -2433,7 +2592,7 @@ int main(int argc, char *argv[])
 	helper_pid = -1;
 	helper_kill_fd = -1;
 	helper_status_fd = -1;
-	
+
 	pthread_mutex_init(&spaces_mutex, NULL);
 	INIT_LIST_HEAD(&spaces);
 	INIT_LIST_HEAD(&spaces_rem);

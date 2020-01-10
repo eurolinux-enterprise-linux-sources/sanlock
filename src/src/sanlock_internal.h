@@ -68,7 +68,8 @@ struct sync_disk {
  */
 
 #define T_RESTRICT_SIGKILL	0x00000001 /* inherited from client->restricted */
-#define T_LS_DEAD		0x00000002 /* don't bother trying to release if ls is dead */
+#define T_RESTRICT_SIGTERM	0x00000002 /* inherited from client->restricted */
+#define T_LS_DEAD		0x00000004 /* don't bother trying to release if ls is dead */
 
 struct token {
 	/* values copied from acquire res arg */
@@ -99,6 +100,7 @@ struct token {
 #define R_THREAD_EXAMINE    	0x00000002
 #define R_THREAD_RELEASE	0x00000004
 #define R_RESTRICT_SIGKILL	0x00000008 /* inherited from token */
+#define R_RESTRICT_SIGTERM	0x00000010 /* inherited from token */
 
 struct resource {
 	struct list_head list;
@@ -109,6 +111,8 @@ struct resource {
 	int pid;                     /* copied from token when ex */
 	uint32_t flags;
 	uint32_t release_token_id;   /* copy to temp token (tt) for log messages */
+	char killpath[SANLK_HELPER_PATH_LEN]; /* copied from client */
+	char killargs[SANLK_HELPER_ARGS_LEN]; /* copied from client */
 	struct leader_record leader; /* copy of last leader_record we wrote */
 	struct sanlk_resource r;
 };
@@ -254,7 +258,8 @@ struct command_line {
 	int debug_renew;
 	int quiet_fail;
 	int use_watchdog;
-	int high_priority;
+	int high_priority;		/* -h */
+	int get_hosts;			/* -h */
 	int mlock_level;
 	int max_worker_threads;
 	int aio_arg;
@@ -302,15 +307,15 @@ enum {
 	ACT_ACQUIRE_ID,
 	ACT_RELEASE_ID,
 	ACT_RENEW_ID,
-	ACT_READ_ID,
-	ACT_LIVE_ID,
 	ACT_DIRECT_INIT,
 	ACT_DUMP,
 	ACT_NEXT_FREE,
 	ACT_READ_LEADER,
 	ACT_CLIENT_INIT,
+	ACT_CLIENT_READ,
 	ACT_CLIENT_ALIGN,
 	ACT_EXAMINE,
+	ACT_GETS,
 };
 
 EXTERN int external_shutdown;

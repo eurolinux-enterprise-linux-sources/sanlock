@@ -42,4 +42,16 @@ int paxos_lease_request_read(struct task *task, struct token *token,
 int paxos_lease_request_write(struct task *task, struct token *token,
                               struct request_record *rr);
 
+int paxos_read_resource(struct task *task,
+			struct token *token,
+			struct sanlk_resource *res);
+
+int paxos_read_buf(struct task *task,
+                   struct token *token,
+                   char **buf_out);
+
+int paxos_verify_leader(struct token *token,
+                         struct sync_disk *disk,
+                         struct leader_record *lr,
+                         const char *caller);
 #endif

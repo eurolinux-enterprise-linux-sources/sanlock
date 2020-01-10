@@ -32,20 +32,43 @@
 #define SANLK_REL_ALL		0x00000001
 
 /*
- * request force_mode
- * SANLK_REQ_KILL_PID: send SIGKILL to pid holding the resource, or
- *                     SIGTERM if SIGKILL is restricted
- * SANLK_REQ_SIGUSR1:  send SIGUSR1 to pid holding the resource
+ * request flags
+ *
+ * SANLK_REQUEST_NEXT_LVER
+ * The caller specifies 0 lver in res, and the daemon
+ * automatically requests the current lver + 1.  When
+ * multiple hosts are making requests, this flag can
+ * produce unexpected results, and it would be safer
+ * to read the resource, check that the current owner
+ * is the one being targetted, and use that owner's
+ * lver + 1 as the specifically requested lver.
  */
 
-#define SANLK_REQ_KILL_PID	0x00000001
-#define SANLK_REQ_SIGUSR1	0x00000002
+#define SANLK_REQUEST_NEXT_LVER	0x00000001
+
+/*
+ * request force_mode
+ *
+ * SANLK_REQ_FORCE (SANLK_REQ_KILL_PID deprecated)
+ * Send SIGKILL to the pid holding the resource
+ * (or SIGTERM if SIGKILL is restricted.)
+ *
+ * SANLK_REQ_GRACEFUL
+ * Run killpath against the pid if it is defined, otherwise
+ * send SIGTERM to the pid (or SIGKILL if SIGTERM is restricted).
+ */
+
+#define SANLK_REQ_FORCE			0x00000001
+#define SANLK_REQ_GRACEFUL		0x00000002
+
+/* old name deprecated */
+#define SANLK_REQ_KILL_PID		SANLK_REQ_FORCE
 
 int sanlock_register(void);
 
 int sanlock_restrict(int sock, uint32_t flags);
 
-int sanlock_killpath(int sock, uint32_t flags, char *path, char *args);
+int sanlock_killpath(int sock, uint32_t flags, const char *path, char *args);
 
 int sanlock_acquire(int sock, int pid, uint32_t flags, int res_count,
 		    struct sanlk_resource *res_args[],

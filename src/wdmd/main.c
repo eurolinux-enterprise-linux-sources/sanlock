@@ -49,6 +49,8 @@
 #define DEFAULT_SOCKET_GID 0
 #define DEFAULT_SOCKET_MODE (S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP)
 
+#define WDPATH_SIZE 64
+
 static int test_interval = DEFAULT_TEST_INTERVAL;
 static int fire_timeout = DEFAULT_FIRE_TIMEOUT;
 static int high_priority = DEFAULT_HIGH_PRIORITY;
@@ -63,7 +65,10 @@ static int shm_fd;
 
 static int allow_scripts;
 static int kill_script_sec;
-static char *scripts_dir = (char *)"/etc/wdmd.d";
+static const char *scripts_dir = "/etc/wdmd.d";
+static char watchdog_path[WDPATH_SIZE];
+static char option_path[WDPATH_SIZE];
+static char saved_path[WDPATH_SIZE];
 
 struct script_status {
 	uint64_t start;
@@ -921,13 +926,13 @@ static int open_dev(void)
 	int fd;
 
 	if (dev_fd != -1) {
-		log_error("/dev/watchdog already open fd %d", dev_fd);
+		log_error("watchdog already open fd %d", dev_fd);
 		return -1;
 	}
 
-	fd = open("/dev/watchdog", O_WRONLY | O_CLOEXEC);
+	fd = open(watchdog_path, O_WRONLY | O_CLOEXEC);
 	if (fd < 0) {
-		log_error("no /dev/watchdog, load a watchdog driver");
+		log_error("open %s error %d", watchdog_path, errno);
 		return fd;
 	}
 
@@ -942,7 +947,7 @@ static void close_watchdog_unclean(void)
 		return;
 	}
 
-	log_error("/dev/watchdog closed unclean");
+	log_error("%s closed unclean", watchdog_path);
 	close(dev_fd);
 	dev_fd = -1;
 
@@ -960,17 +965,25 @@ static void close_watchdog(void)
 
 	rv = write(dev_fd, "V", 1);
 	if (rv < 0)
-		log_error("/dev/watchdog disarm write error %d", errno);
+		log_error("%s disarm write error %d", watchdog_path, errno);
 	else
-		log_error("/dev/watchdog disarmed");
+		log_error("%s disarmed", watchdog_path);
 
 	close(dev_fd);
 	dev_fd = -1;
 }
 
-static int setup_watchdog(void)
+static int _setup_watchdog(char *path)
 {
+	struct stat buf;
 	int rv, timeout;
+
+	strncpy(watchdog_path, path, WDPATH_SIZE);
+	watchdog_path[WDPATH_SIZE - 1] = '\0';
+
+	rv = stat(watchdog_path, &buf);
+	if (rv < 0)
+		return -1;
 
 	rv = open_dev();
 	if (rv < 0)
@@ -980,7 +993,7 @@ static int setup_watchdog(void)
 
 	rv = ioctl(dev_fd, WDIOC_GETTIMEOUT, &timeout);
 	if (rv < 0) {
-		log_error("/dev/watchdog failed to report timeout");
+		log_error("%s failed to report timeout", watchdog_path);
 		close_watchdog();
 		return -1;
 	}
@@ -992,20 +1005,84 @@ static int setup_watchdog(void)
 
 	rv = ioctl(dev_fd, WDIOC_SETTIMEOUT, &timeout);
 	if (rv < 0) {
-		log_error("/dev/watchdog failed to set timeout");
+		log_error("%s failed to set timeout", watchdog_path);
 		close_watchdog();
 		return -1;
 	}
 
 	if (timeout != fire_timeout) {
-		log_error("/dev/watchdog failed to set new timeout");
+		log_error("%s failed to set new timeout", watchdog_path);
 		close_watchdog();
 		return -1;
 	}
  out:
-	log_error("/dev/watchdog armed with fire_timeout %d", fire_timeout);
+	log_error("%s armed with fire_timeout %d", watchdog_path, fire_timeout);
+
+	/* TODO: save watchdog_path in /var/run/wdmd/saved_path,
+	 * and in startup read that file, copying it to saved_path */
 
 	return 0;
+}
+
+/*
+ * Order of preference:
+ * . saved path (path used before daemon restart)
+ * . command line option (-w)
+ * . /dev/watchdog0
+ * . /dev/watchdog1
+ * . /dev/watchdog
+ */
+
+static int setup_watchdog(void)
+{
+	int rv;
+
+	if (!saved_path[0])
+		goto opt;
+
+	rv = _setup_watchdog(saved_path);
+	if (!rv)
+		return 0;
+
+ opt:
+	if (!option_path[0] || !strcmp(saved_path, option_path))
+		goto zero;
+
+	rv = _setup_watchdog(option_path);
+	if (!rv)
+		return 0;
+
+ zero:
+	if (!strcmp(saved_path, "/dev/watchdog0") ||
+	    !strcmp(option_path, "/dev/watchdog0"))
+		goto one;
+
+	rv = _setup_watchdog((char *)"/dev/watchdog0");
+	if (!rv)
+		return 0;
+
+ one:
+	if (!strcmp(saved_path, "/dev/watchdog1") ||
+	    !strcmp(option_path, "/dev/watchdog1"))
+		goto old;
+
+	rv = _setup_watchdog((char *)"/dev/watchdog1");
+	if (!rv)
+		return 0;
+
+ old:
+	if (!strcmp(saved_path, "/dev/watchdog") ||
+	    !strcmp(option_path, "/dev/watchdog"))
+		goto out;
+
+	rv = _setup_watchdog((char *)"/dev/watchdog");
+	if (!rv)
+		return 0;
+
+ out:
+	log_error("no watchdog device, load a watchdog driver");
+	return -1;
+
 }
 
 static void pet_watchdog(void)
@@ -1029,7 +1106,8 @@ static void process_signals(int ci)
 		return;
 	}
 
-	if (fdsi.ssi_signo == SIGTERM) {
+	if ((fdsi.ssi_signo == SIGTERM) ||
+			(fdsi.ssi_signo == SIGINT)) {
 		if (!active_clients())
 			daemon_quit = 1;
 	}
@@ -1046,6 +1124,7 @@ static int setup_signals(void)
 
 	sigemptyset(&mask);
 	sigaddset(&mask, SIGTERM);
+	sigaddset(&mask, SIGINT);
 	sigaddset(&mask, SIGHUP);
 
 	rv = sigprocmask(SIG_BLOCK, &mask, NULL);
@@ -1150,7 +1229,7 @@ static int test_loop(void)
 				if (dev_fd == -1) {
 					open_dev();
 					pet_watchdog();
-					log_error("/dev/watchdog reopen");
+					log_error("%s reopen", watchdog_path);
 				} else {
 					pet_watchdog();
 				}
@@ -1185,7 +1264,7 @@ static int lockfile(void)
 	int fd, rv;
 
 	old_umask = umask(0022);
-	rv = mkdir(WDMD_RUN_DIR, 0777);
+	rv = mkdir(WDMD_RUN_DIR, 0775);
 	if (rv < 0 && errno != EEXIST) {
 		umask(old_umask);
 		return rv;
@@ -1306,7 +1385,7 @@ static void print_debug_and_exit(void)
 	if (rv < 0)
 		exit(1);
 
-	write(STDOUT_FILENO, debug_buf, strlen(debug_buf));
+	rv = write(STDOUT_FILENO, debug_buf, strlen(debug_buf));
 
 	exit(0);
 }
@@ -1326,6 +1405,7 @@ static void print_usage_and_exit(int status)
 	printf("-s <path>             path to scripts dir (default %s)\n", scripts_dir);
 	printf("-k <num>              kill unfinished scripts after num seconds (default %d)\n",
 				      kill_script_sec);
+	printf("-w /dev/watchdog      path to the watchdog device to try first\n");
 	exit(status);
 }
 
@@ -1358,7 +1438,7 @@ int main(int argc, char *argv[])
 	        {0,         0,           0,  0 }
 	    };
 
-	    c = getopt_long(argc, argv, "hdVDH:G:S:s:k:",
+	    c = getopt_long(argc, argv, "hdVDH:G:S:s:k:w:",
 	                    long_options, &option_index);
 	    if (c == -1)
 	         break;
@@ -1390,6 +1470,10 @@ int main(int argc, char *argv[])
 		    break;
 		case 'k':
 		    kill_script_sec = atoi(optarg);
+		    break;
+		case 'w':
+		    snprintf(option_path, WDPATH_SIZE, "%s", optarg);
+		    option_path[WDPATH_SIZE - 1] = '\0';
 		    break;
 	    }
 	}

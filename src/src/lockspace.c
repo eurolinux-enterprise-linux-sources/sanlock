@@ -24,6 +24,7 @@
 #include <sys/un.h>
 
 #include "sanlock_internal.h"
+#include "sanlock_admin.h"
 #include "sanlock_sock.h"
 #include "diskio.h"
 #include "log.h"
@@ -37,43 +38,23 @@
 
 static uint32_t space_id_counter = 1;
 
-static struct space *_search_space(char *name,
+static struct space *_search_space(const char *name,
 				   struct sync_disk *disk,
 				   uint64_t host_id,
 				   struct list_head *head1,
 				   struct list_head *head2,
 				   struct list_head *head3)
 {
+	int i;
 	struct space *sp;
+	struct list_head *heads[] = {head1, head2, head3};
 
-	if (head1) {
-		list_for_each_entry(sp, head1, list) {
-			if (name && strncmp(sp->space_name, name, NAME_ID_SIZE))
-				continue;
-			if (disk && strncmp(sp->host_id_disk.path, disk->path, SANLK_PATH_LEN))
-				continue;
-			if (disk && sp->host_id_disk.offset != disk->offset)
-				continue;
-			if (host_id && sp->host_id != host_id)
-				continue;
-			return sp;
+	for (i = 0; i < 3; i++) {
+		if (!heads[i]) {
+			continue;
 		}
-	}
-	if (head2) {
-		list_for_each_entry(sp, head2, list) {
-			if (name && strncmp(sp->space_name, name, NAME_ID_SIZE))
-				continue;
-			if (disk && strncmp(sp->host_id_disk.path, disk->path, SANLK_PATH_LEN))
-				continue;
-			if (disk && sp->host_id_disk.offset != disk->offset)
-				continue;
-			if (host_id && sp->host_id != host_id)
-				continue;
-			return sp;
-		}
-	}
-	if (head3) {
-		list_for_each_entry(sp, head3, list) {
+
+		list_for_each_entry(sp, heads[i], list) {
 			if (name && strncmp(sp->space_name, name, NAME_ID_SIZE))
 				continue;
 			if (disk && strncmp(sp->host_id_disk.path, disk->path, SANLK_PATH_LEN))
@@ -88,12 +69,12 @@ static struct space *_search_space(char *name,
 	return NULL;
 }
 
-struct space *find_lockspace(char *name)
+struct space *find_lockspace(const char *name)
 {
 	return _search_space(name, NULL, 0, &spaces, &spaces_rem, &spaces_add);
 }
 
-int _lockspace_info(char *space_name, struct space_info *spi)
+int _lockspace_info(const char *space_name, struct space_info *spi)
 {
 	struct space *sp;
 
@@ -115,7 +96,7 @@ int _lockspace_info(char *space_name, struct space_info *spi)
 	return -1;
 }
 
-int lockspace_info(char *space_name, struct space_info *spi)
+int lockspace_info(const char *space_name, struct space_info *spi)
 {
 	int rv;
 
@@ -403,8 +384,8 @@ static void *lockspace_thread(void *arg_in)
 	struct task task;
 	struct space *sp;
 	struct leader_record leader;
-	uint64_t delta_begin, last_success;
-	int rv, delta_length, renewal_interval;
+	uint64_t delta_begin, last_success = 0;
+	int rv, delta_length, renewal_interval = 0;
 	int id_renewal_seconds, id_renewal_fail_seconds;
 	int acquire_result, delta_result, read_result;
 	int opened = 0;
@@ -879,7 +860,229 @@ int rem_lockspace_wait(struct sanlk_lockspace *ls, unsigned int space_id)
 	return 0;
 }
 
-/* 
+int get_lockspaces(char *buf, int *len, int *count, int maxlen)
+{
+	struct sanlk_lockspace *ls;
+	struct space *sp;
+	struct list_head *heads[] = {&spaces, &spaces_rem, &spaces_add};
+	int i, rv, sp_count = 0;
+
+	rv = 0;
+	*len = 0;
+	*count = 0;
+	ls = (struct sanlk_lockspace *)buf;
+
+	pthread_mutex_lock(&spaces_mutex);
+	for (i = 0; i < 3; i++) {
+		list_for_each_entry(sp, heads[i], list) {
+			sp_count++;
+
+			if (*len + sizeof(struct sanlk_lockspace) > maxlen) {
+				rv = -ENOSPC;
+				continue;
+			}
+
+			memcpy(ls->name, sp->space_name, NAME_ID_SIZE);
+			memcpy(&ls->host_id_disk, &sp->host_id_disk, sizeof(struct sync_disk));
+			ls->host_id_disk.pad1 = 0;
+			ls->host_id_disk.pad2 = 0;
+			ls->host_id = sp->host_id;
+			ls->flags = 0;
+
+			if (i == 1)
+				ls->flags |= SANLK_LSF_REM;
+			else if (i == 2)
+				ls->flags |= SANLK_LSF_ADD;
+
+			*len += sizeof(struct sanlk_lockspace);
+
+			ls++;
+		}
+	}
+	pthread_mutex_unlock(&spaces_mutex);
+
+	*count = sp_count;
+
+	return rv;
+}
+
+/*
+ * After the lockspace starts, there is a limited amount of
+ * time that we've been watching the other hosts.  This means
+ * we can't make an accurate assessment of their state, because
+ * the state is based on monitoring the hosts for host_fail_seconds
+ * and host_dead_seconds, or seeing a renewal.  When none of
+ * those are true (not enough time monitoring and not seeing a
+ * renewal), we return UNKNOWN.
+ *
+ * (Example number of seconds below are based on hosts using the
+ * default 10 second io timeout.)
+ *
+ * * For hosts that are alive when we start, we return:
+ *   UNKNOWN then LIVE
+ *
+ *   UNKNOWN would typically last for 10-20 seconds, but it's possible that
+ *   UNKNOWN could persist for up to 80 seconds before LIVE is returned.
+ *   LIVE is returned after we see the timestamp change once.
+ * 
+ * * For hosts that are dead when we start, we'd return:
+ *   UNKNOWN then FAIL then DEAD
+ *
+ *   UNKNOWN would last for 80 seconds before we return FAIL.
+ *   FAIL would last for 60 more seconds before we return DEAD.
+ *
+ * * Hosts that are failing and don't recover would be the same as prev.
+ *
+ * * For hosts thet are failing but recover, we'd return:
+ *   UNKNOWN then FAIL then LIVE
+ *
+ *
+ * For another host that is alive when we start,
+ * the sequence of values is:
+ *
+ *  0: we have not yet called check_other_leases()
+ *     first_check = 0,  last_check = 0,  last_live = 0
+ *
+ *     other host renews its lease
+ *
+ * 10: we call check_other_leases() for the first time,
+ *     first_check = 10, last_check = 10, last_live = 10
+ *
+ *     other host renews its lease
+ *
+ * 20: we call check_other_leases() for the second time,
+ *     first_check = 10, last_check = 20, last_live = 20
+ *
+ * At 10, we have not yet seen a renewal from the other host, i.e. we have
+ * not seen its timestamp change (we only have one sample).  The host could
+ * be dead or alive, so we set the state to UNKNOWN.  The way we know
+ * that we have not yet observed the timestamp change is that
+ * first_check == last_live, (10 == 10).
+ *
+ * At 20, we have seen a renewal, i.e. the timestamp changed between checks,
+ * so we return LIVE.
+ *
+ * In the other case, if the host was actually dead, not alive, it would not
+ * have renewed between 10 and 20.  So at 20 we would continue to see
+ * first_check == last_live, and would return UNKNOWN.  If the host remains
+ * dead, we'd continue to report UNKNOWN for the first 80 seconds.
+ * After 80 seconds, we'd return FAIL.  After 140 seconds we'd return DEAD.
+ */
+
+/* Also see host_live() */
+
+static uint32_t get_host_flag(struct space *sp, struct host_status *hs)
+{
+	uint64_t now, last;
+	uint32_t flags;
+	uint32_t other_io_timeout;
+	int other_host_fail_seconds, other_host_dead_seconds;
+
+	now = monotime();
+	other_io_timeout = hs->io_timeout;
+	other_host_fail_seconds = calc_id_renewal_fail_seconds(other_io_timeout);
+	other_host_dead_seconds = calc_host_dead_seconds(other_io_timeout);
+
+	flags = 0;
+
+	if (!hs->timestamp) {
+		flags = SANLK_HOST_FREE;
+		goto out;
+	}
+
+	if (!hs->last_live)
+		last = hs->first_check;
+	else
+		last = hs->last_live;
+
+	if (sp->host_id == hs->owner_id) {
+		/* we are alive */
+		flags = SANLK_HOST_LIVE;
+
+	} else if ((now - last <= other_host_fail_seconds) &&
+		   (hs->first_check == hs->last_live)) {
+		/* we haven't seen the timestamp change yet */
+		flags = SANLK_HOST_UNKNOWN;
+
+	} else if (now - last <= other_host_fail_seconds) {
+		flags = SANLK_HOST_LIVE;
+
+	} else if (now - last > other_host_dead_seconds) {
+		flags = SANLK_HOST_DEAD;
+
+	} else if (now - last > other_host_fail_seconds) {
+		flags = SANLK_HOST_FAIL;
+	}
+out:
+	return flags;
+}
+
+int get_hosts(struct sanlk_lockspace *ls, char *buf, int *len, int *count, int maxlen)
+{
+	struct space *sp;
+	struct host_status *hs;
+	struct sanlk_host *host;
+	int host_count = 0;
+	int i, rv;
+
+	rv = 0;
+	*len = 0;
+	*count = 0;
+	host = (struct sanlk_host *)buf;
+
+	pthread_mutex_lock(&spaces_mutex);
+	sp = _search_space(ls->name, NULL, 0, &spaces, NULL, NULL);
+	if (!sp) {
+		rv = -ENOENT;
+		goto out;
+	}
+
+	/*
+	 * Between add_lockspace completing and the first
+	 * time we call check_other_leases, we don't have
+	 * any data on other hosts, so return this error
+	 * to indicate this to the caller.
+	 */
+	if (!sp->host_status[0].last_check) {
+		rv = -EAGAIN;
+		goto out;
+	}
+
+	for (i = 0; i < DEFAULT_MAX_HOSTS; i++) {
+		hs = &sp->host_status[i];
+
+		if (ls->host_id && ls->host_id != i)
+			continue;
+
+		if (!ls->host_id && !hs->timestamp)
+			continue;
+
+		host_count++;
+
+		if (*len + sizeof(struct sanlk_host) > maxlen) {
+			rv = -ENOSPC;
+			continue;
+		}
+
+		host->host_id = i + 1;
+		host->generation = hs->owner_generation;
+		host->timestamp = hs->timestamp;
+		host->io_timeout = hs->io_timeout;
+		host->flags = get_host_flag(sp, hs);
+
+		*len += sizeof(struct sanlk_host);
+
+		host++;
+	}
+ out:
+	pthread_mutex_unlock(&spaces_mutex);
+
+	*count = host_count;
+
+	return rv;
+}
+
+/*
  * we call stop_host_id() when all pids are gone and we're in a safe state, so
  * it's safe to unlink the watchdog right away here.  We want to sp the unlink
  * as soon as it's safe, so we can reduce the chance we get killed by the

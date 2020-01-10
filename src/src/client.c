@@ -42,13 +42,16 @@ static int connect_socket(int *sock_fd)
 	int rv, s;
 	struct sockaddr_un addr;
 
+	*sock_fd = -1;
 	s = socket(AF_LOCAL, SOCK_STREAM, 0);
 	if (s < 0)
 		return -errno;
 
 	rv = sanlock_socket_address(&addr);
-	if (rv < 0)
+	if (rv < 0) {
+		close(s);
 		return rv;
+	}
 
 	rv = connect(s, (struct sockaddr *) &addr, sizeof(struct sockaddr_un));
 	if (rv < 0) {
@@ -160,6 +163,165 @@ int sanlock_rem_lockspace(struct sanlk_lockspace *ls, uint32_t flags)
 	return cmd_lockspace(SM_CMD_REM_LOCKSPACE, ls, flags, 0);
 }
 
+int sanlock_get_lockspaces(struct sanlk_lockspace **lss, int *lss_count,
+			   uint32_t flags)
+{
+	struct sanlk_lockspace *lsbuf, *ls;
+	struct sm_header h;
+	int rv, fd, i, ret, recv_count;
+
+	rv = connect_socket(&fd);
+	if (rv < 0)
+		return rv;
+
+	rv = send_header(fd, SM_CMD_GET_LOCKSPACES, flags, 0, 0, 0);
+	if (rv < 0)
+		goto out;
+
+	/* receive result and ls structs */
+
+	memset(&h, 0, sizeof(struct sm_header));
+
+	rv = recv(fd, &h, sizeof(h), MSG_WAITALL);
+	if (rv < 0) {
+		rv = -errno;
+		goto out;
+	}
+
+	if (rv != sizeof(h)) {
+		rv = -1;
+		goto out;
+	}
+
+	/* -ENOSPC means that the daemon's send buffer ran out of space */
+
+	rv = (int)h.data;
+	if (rv < 0 && rv != -ENOSPC)
+		goto out;
+
+	*lss_count = h.data2;
+	recv_count = h.data2;
+
+	if (!lss)
+		goto out;
+
+	lsbuf = malloc(recv_count * sizeof(struct sanlk_lockspace));
+	if (!lsbuf)
+		goto out;
+
+	ls = lsbuf;
+
+	for (i = 0; i < recv_count; i++) {
+		ret = recv(fd, ls, sizeof(struct sanlk_lockspace), MSG_WAITALL);
+		if (ret < 0) {
+			rv = -errno;
+			free(lsbuf);
+			goto out;
+		}
+
+		if (ret != sizeof(struct sanlk_lockspace)) {
+			rv = -1;
+			free(lsbuf);
+			goto out;
+		}
+
+		ls++;
+	}
+
+	*lss = lsbuf;
+ out:
+	close(fd);
+	return rv;
+}
+
+int sanlock_get_hosts(const char *ls_name, uint64_t host_id,
+		      struct sanlk_host **hss, int *hss_count,
+		      uint32_t flags)
+{
+	struct sm_header h;
+	struct sanlk_lockspace ls;
+	struct sanlk_host *hsbuf, *hs;
+	int rv, fd, i, ret, recv_count;
+
+	if (!ls_name)
+		return -EINVAL;
+
+	memset(&ls, 0, sizeof(struct sanlk_lockspace));
+	strncpy(ls.name, ls_name, SANLK_NAME_LEN);
+	ls.host_id = host_id;
+
+	rv = connect_socket(&fd);
+	if (rv < 0)
+		return rv;
+
+	rv = send_header(fd, SM_CMD_GET_HOSTS, flags,
+			 sizeof(struct sanlk_lockspace),
+			 0, 0);
+	if (rv < 0)
+		goto out;
+
+	rv = send(fd, &ls, sizeof(struct sanlk_lockspace), 0);
+	if (rv < 0) {
+		rv = -errno;
+		goto out;
+	}
+
+	/* receive result and ls structs */
+
+	memset(&h, 0, sizeof(struct sm_header));
+
+	rv = recv(fd, &h, sizeof(h), MSG_WAITALL);
+	if (rv < 0) {
+		rv = -errno;
+		goto out;
+	}
+
+	if (rv != sizeof(h)) {
+		rv = -1;
+		goto out;
+	}
+
+	/* -ENOSPC means that the daemon's send buffer ran out of space */
+
+	rv = (int)h.data;
+	if (rv < 0 && rv != -ENOSPC)
+		goto out;
+
+	*hss_count = h.data2;
+	recv_count = h.data2;
+
+	if (!hss)
+		goto out;
+
+	hsbuf = malloc(recv_count * sizeof(struct sanlk_host));
+	if (!hsbuf)
+		goto out;
+
+	hs = hsbuf;
+
+	for (i = 0; i < recv_count; i++) {
+		ret = recv(fd, hs, sizeof(struct sanlk_host), MSG_WAITALL);
+		if (ret < 0) {
+			rv = -errno;
+			free(hsbuf);
+			goto out;
+		}
+
+		if (ret != sizeof(struct sanlk_host)) {
+			rv = -1;
+			free(hsbuf);
+			goto out;
+		}
+
+		hs++;
+	}
+
+	*hss = hsbuf;
+ out:
+	close(fd);
+	return rv;
+}
+
 int sanlock_align(struct sanlk_disk *disk)
 {
 	int rv, fd;
@@ -184,56 +346,370 @@ int sanlock_align(struct sanlk_disk *disk)
 	return rv;
 }
 
-int sanlock_init(struct sanlk_lockspace *ls,
-		 struct sanlk_resource *res,
-		 int max_hosts, int num_hosts)
+int sanlock_read_lockspace(struct sanlk_lockspace *ls, uint32_t flags, uint32_t *io_timeout)
 {
-	int rv, fd, cmd, datalen;
+	struct sm_header h;
+	int rv, fd;
 
-	if (!ls && !res)
+	if (!ls || !ls->host_id_disk.path[0])
 		return -EINVAL;
 
 	rv = connect_socket(&fd);
 	if (rv < 0)
 		return rv;
 
-	if (ls && ls->host_id_disk.path[0]) {
-		cmd = SM_CMD_INIT_LOCKSPACE;
-		datalen = sizeof(struct sanlk_lockspace);
-	} else {
-		cmd = SM_CMD_INIT_RESOURCE;
-		datalen = sizeof(struct sanlk_resource) +
-			  sizeof(struct sanlk_disk) * res->num_disks;
-	}
-
-	rv = send_header(fd, cmd, 0, datalen, max_hosts, num_hosts);
+	rv = send_header(fd, SM_CMD_READ_LOCKSPACE, flags,
+			 sizeof(struct sanlk_lockspace),
+			 0, 0);
 	if (rv < 0)
 		goto out;
 
-	if (ls) {
-		rv = send(fd, ls, sizeof(struct sanlk_lockspace), 0);
-		if (rv < 0) {
-			rv = -errno;
-			goto out;
-		}
-	} else {
-		rv = send(fd, res, sizeof(struct sanlk_resource), 0);
-		if (rv < 0) {
-			rv = -errno;
-			goto out;
-		}
+	rv = send(fd, ls, sizeof(struct sanlk_lockspace), 0);
+	if (rv < 0) {
+		rv = -errno;
+		goto out;
+	}
 
-		rv = send(fd, res->disks, sizeof(struct sanlk_disk) * res->num_disks, 0);
-		if (rv < 0) {
-			rv = -errno;
-			goto out;
-		}
+	/* receive result, io_timeout and ls struct */
+
+	memset(&h, 0, sizeof(struct sm_header));
+
+	rv = recv(fd, &h, sizeof(h), MSG_WAITALL);
+	if (rv < 0) {
+		rv = -errno;
+		goto out;
+	}
+
+	if (rv != sizeof(h)) {
+		rv = -1;
+		goto out;
+	}
+
+	rv = (int)h.data;
+	if (rv < 0)
+		goto out;
+
+	rv = recv(fd, ls, sizeof(struct sanlk_lockspace), MSG_WAITALL);
+	if (rv < 0) {
+		rv = -errno;
+		goto out;
+	}
+
+	if (rv != sizeof(struct sanlk_lockspace)) {
+		rv = -1;
+		goto out;
+	}
+
+	*io_timeout = h.data2;
+	rv = (int)h.data;
+ out:
+	close(fd);
+	return rv;
+}
+
+int sanlock_read_resource(struct sanlk_resource *res, uint32_t flags)
+{
+	struct sm_header h;
+	int rv, fd;
+
+	if (!res || !res->num_disks || res->num_disks > SANLK_MAX_DISKS ||
+	    !res->disks[0].path[0])
+		return -EINVAL;
+
+	rv = connect_socket(&fd);
+	if (rv < 0)
+		return rv;
+
+	rv = send_header(fd, SM_CMD_READ_RESOURCE, flags,
+			 sizeof(struct sanlk_resource) +
+			 sizeof(struct sanlk_disk) * res->num_disks,
+			 0, 0);
+	if (rv < 0)
+		goto out;
+
+	rv = send(fd, res, sizeof(struct sanlk_resource), 0);
+	if (rv < 0) {
+		rv = -errno;
+		goto out;
+	}
+
+	rv = send(fd, res->disks, sizeof(struct sanlk_disk) * res->num_disks, 0);
+	if (rv < 0) {
+		rv = -errno;
+		goto out;
+	}
+
+	/* receive result and res struct */
+
+	memset(&h, 0, sizeof(struct sm_header));
+
+	rv = recv(fd, &h, sizeof(h), MSG_WAITALL);
+	if (rv < 0) {
+		rv = -errno;
+		goto out;
+	}
+
+	if (rv != sizeof(h)) {
+		rv = -1;
+		goto out;
+	}
+
+	rv = (int)h.data;
+	if (rv < 0)
+		goto out;
+
+	rv = recv(fd, res, sizeof(struct sanlk_resource), MSG_WAITALL);
+	if (rv < 0) {
+		rv = -errno;
+		goto out;
+	}
+
+	if (rv != sizeof(struct sanlk_resource)) {
+		rv = -1;
+		goto out;
+	}
+
+	rv = (int)h.data;
+ out:
+	close(fd);
+	return rv;
+}
+
+int sanlock_write_lockspace(struct sanlk_lockspace *ls, int max_hosts,
+			    uint32_t flags, uint32_t io_timeout)
+{
+	int rv, fd;
+
+	if (!ls || !ls->host_id_disk.path[0])
+		return -EINVAL;
+
+	rv = connect_socket(&fd);
+	if (rv < 0)
+		return rv;
+
+	rv = send_header(fd, SM_CMD_WRITE_LOCKSPACE, flags,
+			 sizeof(struct sanlk_lockspace),
+			 max_hosts, io_timeout);
+	if (rv < 0)
+		goto out;
+
+	rv = send(fd, ls, sizeof(struct sanlk_lockspace), 0);
+	if (rv < 0) {
+		rv = -errno;
+		goto out;
 	}
 
 	rv = recv_result(fd);
  out:
 	close(fd);
 	return rv;
+}
+
+int sanlock_write_resource(struct sanlk_resource *res,
+			   int max_hosts, int num_hosts, uint32_t flags)
+{
+	int rv, fd;
+
+	if (!res || !res->num_disks || res->num_disks > SANLK_MAX_DISKS ||
+	    !res->disks[0].path[0])
+		return -EINVAL;
+
+	rv = connect_socket(&fd);
+	if (rv < 0)
+		return rv;
+
+	rv = send_header(fd, SM_CMD_WRITE_RESOURCE, flags,
+			 sizeof(struct sanlk_resource) +
+			 sizeof(struct sanlk_disk) * res->num_disks,
+			 max_hosts, num_hosts);
+	if (rv < 0)
+		goto out;
+
+	rv = send(fd, res, sizeof(struct sanlk_resource), 0);
+	if (rv < 0) {
+		rv = -errno;
+		goto out;
+	}
+
+	rv = send(fd, res->disks, sizeof(struct sanlk_disk) * res->num_disks, 0);
+	if (rv < 0) {
+		rv = -errno;
+		goto out;
+	}
+
+	rv = recv_result(fd);
+ out:
+	close(fd);
+	return rv;
+}
+
+int sanlock_read_resource_owners(struct sanlk_resource *res, uint32_t flags,
+				 struct sanlk_host **hss, int *hss_count)
+{
+	struct sm_header h;
+	struct sanlk_host *hsbuf, *hs;
+	int rv, fd, i, ret, recv_count;
+
+	if (!res || !res->num_disks || res->num_disks > SANLK_MAX_DISKS ||
+	    !res->disks[0].path[0])
+		return -EINVAL;
+
+	rv = connect_socket(&fd);
+	if (rv < 0)
+		return rv;
+
+	rv = send_header(fd, SM_CMD_READ_RESOURCE_OWNERS, flags,
+			 sizeof(struct sanlk_resource) +
+			 sizeof(struct sanlk_disk) * res->num_disks,
+			 0, 0);
+	if (rv < 0)
+		goto out;
+
+	rv = send(fd, res, sizeof(struct sanlk_resource), 0);
+	if (rv < 0) {
+		rv = -errno;
+		goto out;
+	}
+
+	rv = send(fd, res->disks, sizeof(struct sanlk_disk) * res->num_disks, 0);
+	if (rv < 0) {
+		rv = -errno;
+		goto out;
+	}
+
+	/* receive result, res struct, and host structs */
+
+	memset(&h, 0, sizeof(struct sm_header));
+
+	rv = recv(fd, &h, sizeof(h), MSG_WAITALL);
+	if (rv < 0) {
+		rv = -errno;
+		goto out;
+	}
+
+	if (rv != sizeof(h)) {
+		rv = -1;
+		goto out;
+	}
+
+	rv = (int)h.data;
+	if (rv < 0)
+		goto out;
+
+	rv = recv(fd, res, sizeof(struct sanlk_resource), MSG_WAITALL);
+	if (rv < 0) {
+		rv = -errno;
+		goto out;
+	}
+
+	if (rv != sizeof(struct sanlk_resource)) {
+		rv = -1;
+		goto out;
+	}
+
+	rv = 0;
+
+	*hss_count = h.data2;
+	recv_count = h.data2;
+
+	if (!hss)
+		goto out;
+
+	hsbuf = malloc(recv_count * sizeof(struct sanlk_host));
+	if (!hsbuf)
+		goto out;
+
+	hs = hsbuf;
+
+	for (i = 0; i < recv_count; i++) {
+		ret = recv(fd, hs, sizeof(struct sanlk_host), MSG_WAITALL);
+		if (ret < 0) {
+			rv = -errno;
+			free(hsbuf);
+			goto out;
+		}
+
+		if (ret != sizeof(struct sanlk_host)) {
+			rv = -1;
+			free(hsbuf);
+			goto out;
+		}
+
+		hs++;
+	}
+
+	*hss = hsbuf;
+ out:
+	close(fd);
+	return rv;
+}
+
+int sanlock_test_resource_owners(struct sanlk_resource *res GNUC_UNUSED,
+				 uint32_t flags GNUC_UNUSED,
+				 struct sanlk_host *owners, int owners_count,
+				 struct sanlk_host *hosts, int hosts_count,
+				 uint32_t *test_flags)
+{
+	struct sanlk_host *owner, *host;
+	int i, j, found, fail = 0;
+
+	*test_flags = 0;
+
+	owner = owners;
+
+	for (i = 0; i < owners_count; i++) {
+		found = 0;
+		host = hosts;
+		for (j = 0; j < hosts_count; j++) {
+			if (owner->host_id != host->host_id) {
+				host++;
+				continue;
+			}
+			found = 1;
+			break;
+		}
+
+		if (!found)
+			goto next;
+
+		if (host->generation > owner->generation)
+			goto next;
+
+		/* this should not be possible, and should never happen */
+		if (host->generation < owner->generation)
+			return -EINVAL;
+
+		switch (host->flags & SANLK_HOST_MASK) {
+		case SANLK_HOST_FREE:
+		case SANLK_HOST_DEAD:
+			break;
+		case SANLK_HOST_LIVE:
+		case SANLK_HOST_FAIL:
+		case SANLK_HOST_UNKNOWN:
+			fail = 1;
+			break;
+		default:
+			return -EINVAL;
+		}
+ next:
+		owner++;
+	}
+
+	if (fail)
+		*test_flags |= SANLK_TRF_FAIL;
+
+	return 0;
+}
+
+/* old api */
+int sanlock_init(struct sanlk_lockspace *ls,
+		 struct sanlk_resource *res,
+		 int max_hosts, int num_hosts)
+{
+	if (ls)
+		return sanlock_write_lockspace(ls, max_hosts, 0, 0);
+	else
+		return sanlock_write_resource(res, max_hosts, num_hosts, 0);
 }
 
 /* src has colons unescaped, dst should have them escaped with backslash */
@@ -265,7 +741,7 @@ size_t sanlock_path_export(char *dst, const char *src, size_t dstlen)
 	return 0;
 }
 
-/* src has colons escaped with backslash, dst should have backslash removed */ 
+/* src has colons escaped with backslash, dst should have backslash removed */
 
 size_t sanlock_path_import(char *dst, const char *src, size_t dstlen)
 {
@@ -319,7 +795,7 @@ int sanlock_restrict(int sock, uint32_t flags)
 	return rv;
 }
 
-int sanlock_killpath(int sock, uint32_t flags, char *path, char *args)
+int sanlock_killpath(int sock, uint32_t flags, const char *path, char *args)
 {
 	char path_max[SANLK_HELPER_PATH_LEN];
 	char args_max[SANLK_HELPER_ARGS_LEN];
@@ -567,6 +1043,9 @@ int sanlock_request(uint32_t flags, uint32_t force_mode,
 		    struct sanlk_resource *res)
 {
 	int fd, rv, datalen;
+
+	if (!res)
+		return -EINVAL;
 
 	datalen = sizeof(struct sanlk_resource) +
 		  sizeof(struct sanlk_disk) * res->num_disks;

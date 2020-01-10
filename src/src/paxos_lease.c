@@ -269,7 +269,7 @@ static int run_ballot(struct task *task, struct token *token, int num_hosts,
 	int sector_size = token->disks[0].sector_size;
 	int sector_count;
 	int iobuf_len;
-	int d, q, rv;
+	int d, q, rv = 0;
 	int q_max = -1;
 	int error;
 
@@ -685,11 +685,78 @@ static int verify_leader(struct token *token,
 	return result;
 }
 
+int paxos_verify_leader(struct token *token,
+			 struct sync_disk *disk,
+			 struct leader_record *lr,
+			 const char *caller)
+{
+	return verify_leader(token, disk, lr, caller);
+}
+
 static int leaders_match(struct leader_record *a, struct leader_record *b)
 {
 	if (!memcmp(a, b, LEADER_COMPARE_LEN))
 		return 1;
 	return 0;
+}
+
+/* read the lockspace name and resource name given the disk location */
+
+int paxos_read_resource(struct task *task,
+			struct token *token,
+			struct sanlk_resource *res)
+{
+	struct leader_record leader;
+	int rv;
+
+	memset(&leader, 0, sizeof(struct leader_record));
+
+	rv = read_leader(task, token, &token->disks[0], &leader);
+	if (rv < 0)
+		return rv;
+
+	if (!res->lockspace_name[0])
+		memcpy(token->r.lockspace_name, leader.space_name, NAME_ID_SIZE);
+
+	if (!res->name[0])
+		memcpy(token->r.name, leader.resource_name, NAME_ID_SIZE);
+
+	rv = verify_leader(token, &token->disks[0], &leader, "read_resource");
+
+	if (rv == SANLK_OK) {
+		memcpy(res->lockspace_name, leader.space_name, NAME_ID_SIZE);
+		memcpy(res->name, leader.resource_name, NAME_ID_SIZE);
+		res->lver = leader.lver;
+	}
+
+	return rv;
+}
+
+int paxos_read_buf(struct task *task,
+		   struct token *token,
+		   char **buf_out)
+{
+	char *iobuf, **p_iobuf;
+	struct sync_disk *disk = &token->disks[0];
+	int rv, iobuf_len;
+
+	iobuf_len = direct_align(disk);
+	if (iobuf_len < 0)
+		return iobuf_len;
+
+	p_iobuf = &iobuf;
+
+	rv = posix_memalign((void *)p_iobuf, getpagesize(), iobuf_len);
+	if (rv)
+		return rv;
+
+	memset(iobuf, 0, iobuf_len);
+
+	rv = read_iobuf(disk->fd, disk->offset, iobuf, iobuf_len, task, token->io_timeout);
+
+	*buf_out = iobuf;
+
+	return rv;
 }
 
 static int _leader_read_one(struct task *task,
@@ -917,7 +984,7 @@ static int _lease_read_num(struct task *task,
 	int *leader_reps;
 	int num_disks = token->r.num_disks;
 	int leaders_len, leader_reps_len;
-	int i, d, rv, found, num_reads, q_one, tmp_q = -1;
+	int i, d, rv = 0, found, num_reads, q_one, tmp_q = -1;
 
 	leaders_len = num_disks * sizeof(struct leader_record);
 	leader_reps_len = num_disks * sizeof(int);
@@ -1096,6 +1163,33 @@ static int write_new_leader(struct task *task,
  * 	write_new_leader()	1 write  512 bytes (1 leader sector)
  *
  * 				6 i/os = 3 1MB reads, 3 512 byte writes
+ */
+
+/*
+ * When a lease is held by host A, and host B attempts to acquire it,
+ * host B will sometimes fail quickly (within a second) with IDLIVE/-243,
+ * but other times will fail slowly (several seconds) with IDLIVE/-243.
+ * This comes from the fact that this function (on B) is looking for a change
+ * in A's delta timestamp.  To detect a timestamp change, we compare the
+ * last timestamp from A that was seen by our own renewal thread, against
+ * the delta timestamp from A that we read here directly.
+ *
+ * time X: our own delta renewal thread reads A's delta timestamp as 100
+ * time Y: host A renews its delta lease, writing timestamp 120
+ * time Z: our own delta renewal thread reads A's delta timestamp as 120
+ *
+ * If we try to acquire a resource lease held by A between time X and Y,
+ * paxos_lease_acquire() will read A's timestamp as 100, the same as our
+ * own renewal thread last saw.  paxos_lease_acquire() will reread A's
+ * delta lease once a second until it changes at time Y, at which point
+ * it will return IDLIVE.  If Y is very shortly before Z, then
+ * paxos_lease_acquire() can take up to 20 seconds to return IDLIVE.
+ *
+ * If we try to acquire a resource lease held by A between time Y and Z,
+ * paxos_lease_acquire() will read A's timestamp as 120, which is newer
+ * than our own renewal thread last saw.  paxos_lease_acquire() will
+ * fail immediately returning IDLIVE.  If Y is very shortly after X,
+ * then paxos_lease_acquire() will return IDLIVE quickly most of the time.
  */
 
 int paxos_lease_acquire(struct task *task,
@@ -1664,6 +1758,15 @@ int paxos_lease_init(struct task *task,
 		num_hosts = DEFAULT_MAX_HOSTS;
 	if (!max_hosts)
 		max_hosts = DEFAULT_MAX_HOSTS;
+
+	if (max_hosts > DEFAULT_MAX_HOSTS)
+		return -E2BIG;
+
+	if (num_hosts > DEFAULT_MAX_HOSTS)
+		return -EINVAL;
+
+	if (num_hosts > max_hosts)
+		return -EINVAL;
 
 	sector_size = token->disks[0].sector_size;
 
