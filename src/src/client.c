@@ -116,7 +116,7 @@ static int recv_result(int fd)
 	return (int)h.data;
 }
 
-static int cmd_lockspace(int cmd, struct sanlk_lockspace *ls, uint32_t flags)
+static int cmd_lockspace(int cmd, struct sanlk_lockspace *ls, uint32_t flags, uint32_t data)
 {
 	int rv, fd;
 
@@ -124,7 +124,7 @@ static int cmd_lockspace(int cmd, struct sanlk_lockspace *ls, uint32_t flags)
 	if (rv < 0)
 		return rv;
 
-	rv = send_header(fd, cmd, flags, sizeof(struct sanlk_lockspace), 0, 0);
+	rv = send_header(fd, cmd, flags, sizeof(struct sanlk_lockspace), data, 0);
 	if (rv < 0)
 		goto out;
 
@@ -142,17 +142,22 @@ static int cmd_lockspace(int cmd, struct sanlk_lockspace *ls, uint32_t flags)
 
 int sanlock_add_lockspace(struct sanlk_lockspace *ls, uint32_t flags)
 {
-	return cmd_lockspace(SM_CMD_ADD_LOCKSPACE, ls, flags);
+	return cmd_lockspace(SM_CMD_ADD_LOCKSPACE, ls, flags, 0);
+}
+
+int sanlock_add_lockspace_timeout(struct sanlk_lockspace *ls, uint32_t flags, uint32_t io_timeout)
+{
+	return cmd_lockspace(SM_CMD_ADD_LOCKSPACE, ls, flags, io_timeout);
 }
 
 int sanlock_inq_lockspace(struct sanlk_lockspace *ls, uint32_t flags)
 {
-	return cmd_lockspace(SM_CMD_INQ_LOCKSPACE, ls, flags);
+	return cmd_lockspace(SM_CMD_INQ_LOCKSPACE, ls, flags, 0);
 }
 
 int sanlock_rem_lockspace(struct sanlk_lockspace *ls, uint32_t flags)
 {
-	return cmd_lockspace(SM_CMD_REM_LOCKSPACE, ls, flags);
+	return cmd_lockspace(SM_CMD_REM_LOCKSPACE, ls, flags, 0);
 }
 
 int sanlock_align(struct sanlk_disk *disk)
@@ -233,28 +238,56 @@ int sanlock_init(struct sanlk_lockspace *ls,
 
 /* src has colons unescaped, dst should have them escaped with backslash */
 
-static void copy_path_out(char *dst, char *src)
+size_t sanlock_path_export(char *dst, const char *src, size_t dstlen)
 {
-	int i, j = 0;
+	size_t j = 0, escaped = 0;
+	const char *p = src;
 
-	for (i = 0; i < strlen(src); i++) {
-		if (src[i] == ':')
-			dst[j++] = '\\';
-		dst[j++] = src[i];
+	while (j < dstlen) {
+		if (*p == ':' || *p == '\\') {
+			if (!escaped) {
+				dst[j] = '\\', escaped = 1;
+				goto next_loop;
+			}
+
+			escaped = 0;
+		}
+
+		dst[j] = *p;
+
+		if (*p == '\0') return j; /* success */
+		p++;
+
+ next_loop:
+		j++;
 	}
+
+	return 0;
 }
 
 /* src has colons escaped with backslash, dst should have backslash removed */ 
 
-static void copy_path_in(char *dst, char *src)
+size_t sanlock_path_import(char *dst, const char *src, size_t dstlen)
 {
-	int i, j = 0;
+	size_t j = 0;
+	const char *p = src;
 
-	for (i = 0; i < strlen(src); i++) {
-		if (src[i] == '\\')
-			continue;
-		dst[j++] = src[i];
+	while (j < dstlen) {
+		if (*p == '\\')
+			goto next_loop;
+
+		dst[j] = *p;
+
+		if (*p == '\0')
+			return j;
+
+		j++;
+
+ next_loop:
+		p++;
 	}
+
+	return 0;
 }
 
 int sanlock_register(void)
@@ -283,6 +316,41 @@ int sanlock_restrict(int sock, uint32_t flags)
 		return rv;
 
 	rv = recv_result(sock);
+	return rv;
+}
+
+int sanlock_killpath(int sock, uint32_t flags, char *path, char *args)
+{
+	char path_max[SANLK_HELPER_PATH_LEN];
+	char args_max[SANLK_HELPER_ARGS_LEN];
+	int rv, datalen;
+
+	datalen = SANLK_HELPER_PATH_LEN + SANLK_HELPER_ARGS_LEN;
+
+	memset(path_max, 0, sizeof(path_max));
+	memset(args_max, 0, sizeof(args_max));
+
+	snprintf(path_max, SANLK_HELPER_PATH_LEN-1, "%s", path);
+	snprintf(args_max, SANLK_HELPER_ARGS_LEN-1, "%s", args);
+
+	rv = send_header(sock, SM_CMD_KILLPATH, flags, datalen, 0, -1);
+	if (rv < 0)
+		return rv;
+
+	rv = send(sock, path_max, SANLK_HELPER_PATH_LEN, 0);
+	if (rv < 0) {
+		rv = -errno;
+		goto out;
+	}
+
+	rv = send(sock, args_max, SANLK_HELPER_ARGS_LEN, 0);
+	if (rv < 0) {
+		rv = -errno;
+		goto out;
+	}
+
+	rv = recv_result(sock);
+ out:
 	return rv;
 }
 
@@ -596,7 +664,7 @@ int sanlock_res_to_str(struct sanlk_resource *res, char **str_ret)
 
 	for (d = 0; d < res->num_disks; d++) {
 		memset(path, 0, sizeof(path));
-		copy_path_out(path, res->disks[d].path);
+		sanlock_path_export(path, res->disks[d].path, sizeof(path));
 
 		ret = snprintf(str + pos, len - pos, ":%s:%llu", path,
 			       (unsigned long long)res->disks[d].offset);
@@ -906,7 +974,7 @@ int sanlock_str_to_lockspace(char *str, struct sanlk_lockspace *ls)
 	if (host_id)
 		ls->host_id = atoll(host_id);
 	if (path)
-		copy_path_in(ls->host_id_disk.path, path);
+		sanlock_path_import(ls->host_id_disk.path, path, sizeof(ls->host_id_disk.path));
 	if (offset)
 		ls->host_id_disk.offset = atoll(offset);
 

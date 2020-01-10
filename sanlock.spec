@@ -1,6 +1,6 @@
 Name:           sanlock
-Version:        2.3
-Release:        1%{?dist}
+Version:        2.6
+Release:        2%{?dist}
 Summary:        A shared disk lock manager
 
 Group:          System Environment/Base
@@ -26,6 +26,7 @@ access to the shared disks.
 CFLAGS=$RPM_OPT_FLAGS make -C wdmd
 CFLAGS=$RPM_OPT_FLAGS make -C src
 CFLAGS=$RPM_OPT_FLAGS make -C python
+CFLAGS=$RPM_OPT_FLAGS make -C fence_sanlock
 
 %install
 rm -rf $RPM_BUILD_ROOT
@@ -38,15 +39,22 @@ make -C wdmd \
 make -C python \
         install LIBDIR=%{_libdir} \
         DESTDIR=$RPM_BUILD_ROOT
+make -C fence_sanlock \
+        install LIBDIR=%{_libdir} \
+        DESTDIR=$RPM_BUILD_ROOT
+
 
 %if 0%{?fedora} >= 16
 install -D -m 0755 init.d/sanlock $RPM_BUILD_ROOT/lib/systemd/systemd-sanlock
 install -D -m 0644 init.d/sanlock.service $RPM_BUILD_ROOT/%{_unitdir}/sanlock.service
 install -D -m 0755 init.d/wdmd $RPM_BUILD_ROOT/lib/systemd/systemd-wdmd
 install -D -m 0644 init.d/wdmd.service $RPM_BUILD_ROOT/%{_unitdir}/wdmd.service
+install -D -m 0755 init.d/fence_sanlockd $RPM_BUILD_ROOT/lib/systemd/systemd-fence_sanlockd
+install -D -m 0644 init.d/fence_sanlockd.service $RPM_BUILD_ROOT/%{_unitdir}/fence_sanlockd.service
 %else
 install -D -m 755 init.d/sanlock $RPM_BUILD_ROOT/%{_initddir}/sanlock
 install -D -m 755 init.d/wdmd $RPM_BUILD_ROOT/%{_initddir}/wdmd
+install -D -m 755 init.d/fence_sanlockd $RPM_BUILD_ROOT/%{_initddir}/fence_sanlockd
 %endif
 
 install -Dm 0644 src/logrotate.sanlock \
@@ -54,6 +62,15 @@ install -Dm 0644 src/logrotate.sanlock \
 
 install -Dm 0644 src/sysconfig.sanlock \
 	$RPM_BUILD_ROOT/etc/sysconfig/sanlock
+
+install -Dm 0644 wdmd/sysconfig.wdmd \
+	$RPM_BUILD_ROOT/etc/sysconfig/wdmd
+
+install -dm 0755 $RPM_BUILD_ROOT/etc/wdmd.d
+
+install -Dd -m 775 $RPM_BUILD_ROOT/%{_localstatedir}/run/sanlock
+install -Dd -m 775 $RPM_BUILD_ROOT/%{_localstatedir}/run/fence_sanlock
+install -Dd -m 775 $RPM_BUILD_ROOT/%{_localstatedir}/run/fence_sanlockd
 
 %clean
 rm -rf $RPM_BUILD_ROOT
@@ -64,6 +81,7 @@ getent group sanlock > /dev/null || /usr/sbin/groupadd \
 getent passwd sanlock > /dev/null || /usr/sbin/useradd \
 	-u 179 -c "sanlock" -s /sbin/nologin -r \
 	-g 179 -d /var/run/sanlock sanlock
+/usr/sbin/usermod -a -G disk sanlock
 
 %post
 if [ $1 -eq 1 ] ; then
@@ -114,10 +132,13 @@ fi
 %endif
 %{_sbindir}/sanlock
 %{_sbindir}/wdmd
+%dir /etc/wdmd.d
+%dir %attr(-,sanlock,sanlock) %{_localstatedir}/run/sanlock
 %{_mandir}/man8/wdmd*
 %{_mandir}/man8/sanlock*
 %config(noreplace) %{_sysconfdir}/logrotate.d/sanlock
 %config(noreplace) %{_sysconfdir}/sysconfig/sanlock
+%config(noreplace) %{_sysconfdir}/sysconfig/wdmd
 
 %package        lib
 Summary:        A shared disk lock manager library
@@ -175,8 +196,67 @@ developing applications that use %{name}.
 %{_includedir}/sanlock_resource.h
 %{_includedir}/sanlock_direct.h
 
+%package -n     fence-sanlock
+Summary:        Fence agent using sanlock and wdmd
+Group:          System Environment/Base
+Requires:       sanlock = %{version}-%{release}
+Requires:       sanlock-lib = %{version}-%{release}
+
+%description -n fence-sanlock
+The fence-sanlock package contains the fence agent and
+daemon for using sanlock and wdmd as a cluster fence agent.
+
+%files -n       fence-sanlock
+%defattr(-,root,root,-)
+%if 0%{?fedora} >= 16
+/lib/systemd/systemd-fence_sanlockd
+%{_unitdir}/fence_sanlockd.service
+%else
+%{_initddir}/fence_sanlockd
+%endif
+%{_sbindir}/fence_sanlock
+%{_sbindir}/fence_sanlockd
+%dir %attr(-,root,root) %{_localstatedir}/run/fence_sanlock
+%dir %attr(-,root,root) %{_localstatedir}/run/fence_sanlockd
+%{_mandir}/man8/fence_sanlock*
+
+%post -n        fence-sanlock
+if [ $1 -eq 1 ] ; then
+%if 0%{?fedora} >= 16
+  /bin/systemctl daemon-reload >/dev/null 2>&1 || :
+%else
+  /sbin/chkconfig --add fence_sanlockd
+%endif
+ccs_update_schema > /dev/null 2>&1 ||:
+fi
+
+%preun -n       fence-sanlock
+if [ $1 = 0 ]; then
+%if 0%{?fedora} >= 16
+  /bin/systemctl --no-reload fence_sanlockd.service > /dev/null 2>&1 || :
+%else
+  /sbin/service fence_sanlockd stop > /dev/null 2>&1
+  /sbin/chkconfig --del fence_sanlockd
+%endif
+fi
+
+%postun -n      fence-sanlock
+if [ $1 -ge 1 ] ; then
+%if 0%{?fedora} >= 16
+  /bin/systemctl try-restart fence_sanlockd.service > /dev/null 2>&1 || :
+%else 
+  /sbin/service fence_sanlockd condrestart >/dev/null 2>&1 || :
+%endif
+fi
+
 %changelog
-* Wed May 30 2012 David Teigland <teigland@redhat.com> - 2.3
+* Tue Oct 09 2012 David Teigland <teigland@redhat.com> - 2.6-1
+- Resolves: rhbz#858964 rhbz#843073
+
+* Mon Sep 24 2012 David Teigland <teigland@redhat.com> - 2.5-1
+- Resolves: rhbz#826022 rhbz#830736 rhbz#830848 rhbz#831906 rhbz#832935 rhbz#840063 rhbz#841305 rhbz#843073
+
+* Wed May 30 2012 David Teigland <teigland@redhat.com> - 2.3-1
 - Update to sanlock-2.3
 
 * Fri May 25 2012 Federico Simoncelli <fsimonce@redhat.com> 2.2-2

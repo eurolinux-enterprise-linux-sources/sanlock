@@ -18,9 +18,15 @@
 
 #define SANLK_NAME_LEN		48   
 
-/* max disk path length, includes terminating \0 byte */
+/* max disk path length, includes terminating \0 byte, and escape chars,
+   i.e. the strlen with esc chars inserted must still be less than 1024. */
 
 #define SANLK_PATH_LEN		1024
+
+/* max length of kill script path and args, includes terminate \0 byte */
+
+#define SANLK_HELPER_PATH_LEN	128
+#define SANLK_HELPER_ARGS_LEN	128
 
 /* max disks in a single lease */
 
@@ -86,5 +92,7 @@ struct sanlk_lockspace {
 	struct sanlk_disk host_id_disk;
 };
 
-#endif
+size_t sanlock_path_export(char *dst, const char *src, size_t dstlen);
+size_t sanlock_path_import(char *dst, const char *src, size_t dstlen);
 
+#endif

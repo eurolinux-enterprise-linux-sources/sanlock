@@ -24,6 +24,7 @@
 #include <pwd.h>
 #include <grp.h>
 #include <sys/types.h>
+#include <sys/prctl.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -32,6 +33,7 @@
 #include <sys/mman.h>
 #include <sys/mman.h>
 #include <sys/utsname.h>
+#include <sys/resource.h>
 #include <uuid/uuid.h>
 
 #define EXTERN
@@ -49,8 +51,10 @@
 #include "task.h"
 #include "client_cmd.h"
 #include "cmd.h"
+#include "helper.h"
+#include "timeouts.h"
 
-#define RELEASE_VERSION "2.3"
+#define SIGRUNPATH 100 /* anything that's not SIGTERM/SIGKILL */
 
 struct thread_pool {
 	int num_workers;
@@ -80,6 +84,100 @@ static struct random_data rand_data;
 static char rand_state[32];
 static pthread_mutex_t rand_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+static void close_helper(void)
+{
+	close(helper_kill_fd);
+	close(helper_status_fd);
+	helper_kill_fd = -1;
+	helper_status_fd = -1;
+	pollfd[helper_ci].fd = -1;
+	pollfd[helper_ci].events = 0;
+	helper_ci = -1;
+
+	/* don't set helper_pid = -1 until we've tried waitpid */
+}
+
+/*
+ * We cannot block the main thread on this write, so the pipe is
+ * NONBLOCK, and write fails with EAGAIN when the pipe is full.
+ * With 512 msg size and 64k default pipe size, the pipe will be full
+ * if we quickly send kill messages for 128 pids.  We retry
+ * the kill once a second, so we'll retry the write again in
+ * a second.
+ *
+ * By setting the pipe size to 1MB in setup_helper, we could quickly send 2048
+ * msgs before getting EAGAIN.
+ */
+
+static void send_helper_kill(struct space *sp, struct client *cl, int sig)
+{
+	struct helper_msg hm;
+	int rv;
+
+	/*
+	 * We come through here once a second while the pid still has
+	 * leases.  We only send a single RUNPATH message, so after
+	 * the first RUNPATH goes through we set CL_RUNPATH_SENT to
+	 * avoid futher RUNPATH's.
+	 */
+
+	if ((cl->flags & CL_RUNPATH_SENT) && (sig == SIGRUNPATH))
+		return;
+
+	if (helper_kill_fd == -1) {
+		log_error("send_helper_kill pid %d no fd", cl->pid);
+		return;
+	}
+
+	memset(&hm, 0, sizeof(hm));
+
+	if (sig == SIGRUNPATH) {
+		hm.type = HELPER_MSG_RUNPATH;
+		memcpy(hm.path, cl->killpath, SANLK_HELPER_PATH_LEN);
+		memcpy(hm.args, cl->killargs, SANLK_HELPER_ARGS_LEN);
+
+		/* only include pid if it's requested as a killpath arg */
+		if (cl->flags & CL_KILLPATH_PID)
+			hm.pid = cl->pid;
+	} else {
+		hm.type = HELPER_MSG_KILLPID;
+		hm.sig = sig;
+		hm.pid = cl->pid;
+	}
+
+	log_erros(sp, "kill %d sig %d count %d", cl->pid, sig, cl->kill_count);
+
+ retry:
+	rv = write(helper_kill_fd, &hm, sizeof(hm));
+	if (rv == -1 && errno == EINTR)
+		goto retry;
+
+	/* pipe is full, we'll try again in a second */
+	if (rv == -1 && errno == EAGAIN) {
+		helper_full_count++;
+		log_space(sp, "send_helper_kill pid %d sig %d full_count %u",
+			  cl->pid, sig, helper_full_count);
+		return;
+	}
+
+	/* helper exited or closed fd, quit using helper */
+	if (rv == -1 && errno == EPIPE) {
+		log_erros(sp, "send_helper_kill EPIPE");
+		close_helper();
+		return;
+	}
+
+	if (rv != sizeof(hm)) {
+		/* this shouldn't happen */
+		log_erros(sp, "send_helper_kill pid %d error %d %d",
+			  cl->pid, rv, errno);
+		close_helper();
+		return;
+	}
+
+	if (sig == SIGRUNPATH)
+		cl->flags |= CL_RUNPATH_SENT;
+}
 
 /* FIXME: add a mutex for client array so we don't try to expand it
    while a cmd thread is using it.  Or, with a thread pool we know
@@ -153,8 +251,11 @@ static void _client_free(int ci)
 	cl->need_free = 0;
 	cl->kill_count = 0;
 	cl->kill_last = 0;
-	cl->restrict = 0;
+	cl->restricted = 0;
+	cl->flags = 0;
 	memset(cl->owner_name, 0, sizeof(cl->owner_name));
+	memset(cl->killpath, 0, SANLK_HELPER_PATH_LEN);
+	memset(cl->killargs, 0, SANLK_HELPER_ARGS_LEN);
 	cl->workfn = NULL;
 	cl->deadfn = NULL;
 	memset(cl->tokens, 0, sizeof(struct token *) * SANLK_MAX_RESOURCES);
@@ -293,13 +394,22 @@ void client_recv_all(int ci, struct sm_header *h_recv, int pos)
 {
 	char trash[64];
 	int rem = h_recv->length - sizeof(struct sm_header) - pos;
-	int rv, error = 0, total = 0;
+	int rv, error = 0, total = 0, retries = 0;
 
 	if (!rem)
 		return;
 
 	while (1) {
 		rv = recv(client[ci].fd, trash, sizeof(trash), MSG_DONTWAIT);
+
+		if (rv == -1 && errno == EAGAIN) {
+			usleep(1000);
+			if (retries < 20) {
+				retries++;
+				continue;
+			}
+		}
+
 		if (rv == -1)
 			error = errno;
 		if (rv <= 0)
@@ -310,8 +420,8 @@ void client_recv_all(int ci, struct sm_header *h_recv, int pos)
 			break;
 	}
 
-	log_debug("recv_all %d,%d,%d pos %d rv %d error %d rem %d total %d",
-		  ci, client[ci].fd, client[ci].pid, pos, rv, error, rem, total);
+	log_debug("recv_all %d,%d,%d pos %d rv %d error %d retries %d rem %d total %d",
+		  ci, client[ci].fd, client[ci].pid, pos, rv, error, retries, rem, total);
 }
 
 void send_result(int fd, struct sm_header *h_recv, int result);
@@ -351,6 +461,9 @@ void client_pid_dead(int ci)
 	log_debug("client_pid_dead %d,%d,%d cmd_active %d suspend %d",
 		  ci, cl->fd, cl->pid, cl->cmd_active, cl->suspend);
 
+	if (cl->kill_count)
+		log_error("dead %d ci %d count %d", cl->pid, ci, cl->kill_count);
+
 	cmd_active = cl->cmd_active;
 	pid = cl->pid;
 	cl->pid = -1;
@@ -366,7 +479,11 @@ void client_pid_dead(int ci)
 
 	pthread_mutex_unlock(&cl->mutex);
 
-	kill(pid, SIGKILL);
+	/* it would be nice to do this SIGKILL as a confirmation that the pid
+	   is really gone (i.e. didn't just close the fd) if we always had root
+	   permission to do it */
+
+	/* kill(pid, SIGKILL); */
 
 	if (cmd_active) {
 		log_debug("client_pid_dead %d,%d,%d defer to cmd %d",
@@ -429,14 +546,13 @@ static int client_using_space(struct client *cl, struct space *sp)
 	return rv;
 }
 
-/* TODO: try killscript first if one is provided */
-
 static void kill_pids(struct space *sp)
 {
 	struct client *cl;
-	uint64_t now;
+	uint64_t now, last_success;
+	int id_renewal_fail_seconds;
 	int ci, fd, pid, sig;
-	int do_kill;
+	int do_kill, in_grace;
 
 	/*
 	 * all remaining pids using sp are stuck, we've made max attempts to
@@ -444,6 +560,19 @@ static void kill_pids(struct space *sp)
 	 */
 	if (sp->killing_pids > 1)
 		return;
+
+	id_renewal_fail_seconds = calc_id_renewal_fail_seconds(sp->io_timeout);
+
+	/*
+	 * If we happen to renew our lease after we've started killing pids,
+	 * the period we allow for graceful shutdown will be extended. This
+	 * is an incidental effect, although it may be nice. The previous
+	 * behavior would still be ok, where we only ever allow up to
+	 * kill_grace_seconds for graceful shutdown before moving to sigkill.
+	 */
+	pthread_mutex_lock(&sp->mutex);
+	last_success = sp->lease_status.renewal_last_success;
+	pthread_mutex_unlock(&sp->mutex);
 
 	now = monotime();
 
@@ -462,7 +591,7 @@ static void kill_pids(struct space *sp)
 		/* NB this cl may not be using sp, but trying to
 		   avoid the expensive client_using_space check */
 
-		if (cl->kill_count >= main_task.kill_count_max)
+		if (cl->kill_count >= kill_count_max)
 			goto unlock;
 
 		if (cl->kill_count && (now - cl->kill_last < 1))
@@ -477,13 +606,33 @@ static void kill_pids(struct space *sp)
 		fd = cl->fd;
 		pid = cl->pid;
 
-		if (cl->restrict & SANLK_RESTRICT_SIGKILL)
+		/*
+		 * the transition from using killpath/sigterm to sigkill
+		 * is when now >=
+		 * last successful lease renewal +
+		 * id_renewal_fail_seconds +
+		 * kill_grace_seconds
+		 */
+
+		in_grace = now < (last_success + id_renewal_fail_seconds + kill_grace_seconds);
+
+		if ((kill_grace_seconds > 0) && in_grace && cl->killpath[0]) {
+			sig = SIGRUNPATH;
+		} else if (in_grace) {
 			sig = SIGTERM;
-		else if (cl->restrict & SANLK_RESTRICT_SIGTERM)
+		} else {
 			sig = SIGKILL;
-		else if (cl->kill_count <= main_task.kill_count_term)
+		}
+
+		/*
+		 * sigterm will be used in place of sigkill if restricted
+		 * sigkill will be used in place of sigterm if restricted
+		 */
+
+		if ((sig == SIGKILL) && (cl->restricted & SANLK_RESTRICT_SIGKILL))
 			sig = SIGTERM;
-		else
+
+		if ((sig == SIGTERM) && (cl->restricted & SANLK_RESTRICT_SIGTERM))
 			sig = SIGKILL;
 
 		do_kill = 1;
@@ -493,15 +642,7 @@ static void kill_pids(struct space *sp)
 		if (!do_kill)
 			continue;
 
-		if (cl->kill_count == main_task.kill_count_max) {
-			log_erros(sp, "kill %d,%d,%d sig %d count %d final attempt",
-				  ci, fd, pid, sig, cl->kill_count);
-		} else {
-			log_space(sp, "kill %d,%d,%d sig %d count %d",
-				  ci, fd, pid, sig, cl->kill_count);
-		}
-
-		kill(pid, sig);
+		send_helper_kill(sp, cl, sig);
 	}
 }
 
@@ -522,7 +663,7 @@ static int all_pids_dead(struct space *sp)
 		if (!client_using_space(cl, sp))
 			goto unlock;
 
-		if (cl->kill_count >= main_task.kill_count_max)
+		if (cl->kill_count >= kill_count_max)
 			stuck++;
 		else
 			check++;
@@ -539,7 +680,11 @@ static int all_pids_dead(struct space *sp)
 	if (stuck || check)
 		return 0;
 
-	log_space(sp, "used by no pids");
+	if (sp->renew_fail)
+		log_erros(sp, "all pids clear");
+	else
+		log_space(sp, "all pids clear");
+
 	return 1;
 }
 
@@ -649,7 +794,9 @@ static int main_loop(void)
 
 			check_all = 0;
 
-			rv = check_our_lease(&main_task, sp, &check_all, check_buf);
+			rv = check_our_lease(sp, &check_all, check_buf);
+			if (rv)
+				sp->renew_fail = 1;
 
 			if (rv || sp->external_remove || (external_shutdown > 1)) {
 				log_space(sp, "set killing_pids check %d remove %d",
@@ -660,7 +807,7 @@ static int main_loop(void)
 				check_interval = RECOVERY_CHECK_INTERVAL;
 
 			} else if (check_all) {
-				check_other_leases(&main_task, sp, check_buf);
+				check_other_leases(sp, check_buf);
 			}
 		}
 		empty = list_empty(&spaces);
@@ -695,7 +842,6 @@ static void *thread_pool_worker(void *data)
 	struct cmd_args *ca;
 
 	memset(&task, 0, sizeof(struct task));
-	setup_task_timeouts(&task, main_task.io_timeout_seconds);
 	setup_task_aio(&task, main_task.use_aio, WORKER_AIO_CB_SIZE);
 	snprintf(task.name, NAME_ID_SIZE, "worker%ld", (long)data);
 
@@ -859,6 +1005,8 @@ static void process_cmd_thread_registered(int ci_in, struct sm_header *h_recv)
 			break;
 		}
 		if (ci_target < 0) {
+			log_error("cmd %d target pid %d not found",
+				  h_recv->cmd, h_recv->data2);
 			result = -ESRCH;
 			goto fail;
 		}
@@ -898,7 +1046,9 @@ static void process_cmd_thread_registered(int ci_in, struct sm_header *h_recv)
 		goto out;
 	}
 
-	if (cl->kill_count) {
+	if (cl->kill_count && h_recv->cmd == SM_CMD_ACQUIRE) {
+		/* when pid is being killed, we want killpath to be able
+		   to inquire and release for it */
 		log_error("cmd %d %d,%d,%d kill_count %d",
 			  h_recv->cmd, ci_target, cl->fd, cl->pid, cl->kill_count);
 		result = -EBUSY;
@@ -986,7 +1136,7 @@ static void process_connection(int ci)
 			  ci, rv, h.magic, SM_MAGIC);
 		goto dead;
 	}
-	if (client[ci].restrict & SANLK_RESTRICT_ALL) {
+	if (client[ci].restricted & SANLK_RESTRICT_ALL) {
 		log_error("ci %d fd %d pid %d cmd %d restrict all",
 			  ci, client[ci].fd, client[ci].pid, h.cmd);
 		goto dead;
@@ -1020,6 +1170,7 @@ static void process_connection(int ci)
 	case SM_CMD_ACQUIRE:
 	case SM_CMD_RELEASE:
 	case SM_CMD_INQUIRE:
+	case SM_CMD_KILLPATH:
 		/* the main_loop needs to ignore this connection
 		   while the thread is working on it */
 		rv = client_suspend(ci);
@@ -1100,7 +1251,9 @@ static int setup_listener(void)
 	return -1;
 }
 
-static void sigterm_handler(int sig GNUC_UNUSED)
+static void sigterm_handler(int sig GNUC_UNUSED,
+			    siginfo_t *info GNUC_UNUSED,
+			    void *ctx GNUC_UNUSED)
 {
 	external_shutdown = 1;
 }
@@ -1108,15 +1261,20 @@ static void sigterm_handler(int sig GNUC_UNUSED)
 static void setup_priority(void)
 {
 	struct sched_param sched_param;
-	int rv;
+	int rv = 0;
+
+	if (com.mlock_level == 1)
+		rv = mlockall(MCL_CURRENT);
+	else if (com.mlock_level == 2)
+		rv = mlockall(MCL_CURRENT | MCL_FUTURE);
+
+	if (rv < 0) {
+		log_error("mlockall %d failed: %s",
+			  com.mlock_level, strerror(errno));
+	}
 
 	if (!com.high_priority)
 		return;
-
-	rv = mlockall(MCL_CURRENT | MCL_FUTURE);
-	if (rv < 0) {
-		log_error("mlockall failed: %s", strerror(errno));
-	}
 
 	rv = sched_get_priority_max(SCHED_RR);
 	if (rv < 0) {
@@ -1182,11 +1340,38 @@ static void setup_host_name(void)
 		 uuid, name.nodename);
 }
 
+static void setup_limits(void)
+{
+	int rv;
+	struct rlimit rlim = { .rlim_cur = -1, .rlim_max= -1 };
+
+	rv = setrlimit(RLIMIT_MEMLOCK, &rlim);
+	if (rv < 0) {
+		log_error("cannot set the limits for memlock %i", errno);
+		exit(EXIT_FAILURE);
+	}
+
+	rv = setrlimit(RLIMIT_RTPRIO, &rlim);
+	if (rv < 0) {
+		log_error("cannot set the limits for rtprio %i", errno);
+		exit(EXIT_FAILURE);
+	}
+
+	rv = setrlimit(RLIMIT_CORE, &rlim);
+	if (rv < 0) {
+		log_error("cannot set the limits for core dumps %i", errno);
+		exit(EXIT_FAILURE);
+	}
+}
+
 static void setup_groups(void)
 {
 	int rv, i, j, h;
 	int pngroups, sngroups, ngroups_max;
 	gid_t *pgroup, *sgroup;
+
+	if (!com.uname || !com.gname)
+		return;
 
 	ngroups_max = sysconf(_SC_NGROUPS_MAX);
 	if (ngroups_max < 0) {
@@ -1241,13 +1426,173 @@ static void setup_groups(void)
 		goto out;
 	}
 
+	rv = setgid(com.gid);
+	if (rv < 0) {
+		log_error("cannot set group id to %i errno %i", com.gid, errno);
+	}
+
+	rv = setuid(com.uid);
+	if (rv < 0) {
+		log_error("cannot set user id to %i errno %i", com.uid, errno);
+	}
+
+	/* When a program is owned by a user (group) other than the real user
+	 * (group) ID of the process, the PR_SET_DUMPABLE option gets cleared.
+	 * See RLIMIT_CORE in setup_limits and man 5 core.
+	 */
+	rv = prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
+	if (rv < 0) {
+		log_error("cannot set dumpable process errno %i", errno);
+	}
+
  out:
 	free(pgroup);
 }
 
-static int do_daemon(void)
+static void setup_signals(void)
 {
 	struct sigaction act;
+	int rv, i, sig_list[] = { SIGHUP, SIGINT, SIGTERM, 0 };
+
+	memset(&act, 0, sizeof(act));
+
+	act.sa_flags = SA_SIGINFO;
+	act.sa_sigaction = sigterm_handler;
+
+	for (i = 0; sig_list[i] != 0; i++) {
+		rv = sigaction(sig_list[i], &act, NULL);
+		if (rv < 0) {
+			log_error("cannot set the signal handler for: %i", sig_list[i]);
+			exit(EXIT_FAILURE);
+		}
+	}
+}
+
+/*
+ * first pipe for daemon to send requests to helper; they are not acknowledged
+ * and the daemon does not get any result back for the requests.
+ *
+ * second pipe for helper to send general status/heartbeat back to the daemon
+ * every so often to confirm it's not dead/hung.  If the helper gets stuck or
+ * killed, the daemon will not get the status and won't bother sending requests
+ * to the helper, and use SIGTERM instead
+ */
+
+static int setup_helper(void)
+{
+	int pid;
+	int pw_fd = -1; /* parent write */
+	int cr_fd = -1; /* child read */
+	int pr_fd = -1; /* parent read */
+	int cw_fd = -1; /* child write */
+	int pfd[2];
+
+	/* we can't allow the main daemon thread to block */
+	if (pipe2(pfd, O_NONBLOCK | O_CLOEXEC))
+		return -errno;
+
+	/* uncomment for rhel7 where this should be available */
+	/* fcntl(pfd[1], F_SETPIPE_SZ, 1024*1024); */
+
+	cr_fd = pfd[0];
+	pw_fd = pfd[1];
+
+	if (pipe2(pfd, O_NONBLOCK | O_CLOEXEC)) {
+		close(cr_fd);
+		close(pw_fd);
+		return -errno;
+	}
+
+	pr_fd = pfd[0];
+	cw_fd = pfd[1];
+
+	pid = fork();
+	if (pid < 0) {
+		close(cr_fd);
+		close(pw_fd);
+		close(pr_fd);
+		close(cw_fd);
+		return -errno;
+	}
+
+	if (pid) {
+		close(cr_fd);
+		close(cw_fd);
+		helper_kill_fd = pw_fd;
+		helper_status_fd = pr_fd;
+		helper_pid = pid;
+		return 0;
+	} else {
+		close(pr_fd);
+		close(pw_fd);
+		run_helper(cr_fd, cw_fd, (log_stderr_priority == LOG_DEBUG));
+		exit(0);
+	}
+}
+
+static void process_helper(int ci)
+{
+	struct helper_status hs;
+	int rv;
+
+	memset(&hs, 0, sizeof(hs));
+
+	rv = read(client[ci].fd, &hs, sizeof(hs));
+	if (!rv || rv == -EAGAIN)
+		return;
+	if (rv < 0) {
+		log_error("process_helper rv %d errno %d", rv, errno);
+		goto fail;
+	}
+	if (rv != sizeof(hs)) {
+		log_error("process_helper recv size %d", rv);
+		goto fail;
+	}
+
+	if (hs.type == HELPER_STATUS && !hs.status)
+		helper_last_status = monotime();
+
+	return;
+
+ fail:
+	close_helper();
+}
+
+static void helper_dead(int ci GNUC_UNUSED)
+{
+	int pid = helper_pid;
+	int rv, status;
+
+	close_helper();
+
+	helper_pid = -1;
+
+	rv = waitpid(pid, &status, WNOHANG);
+
+	if (rv != pid) {
+		/* should not happen */
+		log_error("helper pid %d dead wait %d", pid, rv);
+		return;
+	}
+
+	if (WIFEXITED(status)) {
+		log_error("helper pid %d exit status %d", pid,
+			  WEXITSTATUS(status));
+		return;
+	}
+
+	if (WIFSIGNALED(status)) {
+		log_error("helper pid %d term signal %d", pid,
+			  WTERMSIG(status));
+		return;
+	}
+
+	/* should not happen */
+	log_error("helper pid %d state change", pid);
+}
+
+static int do_daemon(void)
+{
 	int fd, rv;
 
 	/* TODO: copy comprehensive daemonization method from libvirtd */
@@ -1257,53 +1602,46 @@ static int do_daemon(void)
 			log_tool("cannot fork daemon\n");
 			exit(EXIT_FAILURE);
 		}
-		umask(0);
 	}
+
+	setup_limits();
+	setup_helper();
 
 	/* main task never does disk io, so we don't really need to set
 	 * it up, but other tasks get their use_aio value by copying
 	 * the main_task settings */
 
 	sprintf(main_task.name, "%s", "main");
-	setup_task_timeouts(&main_task, com.io_timeout_arg);
 	setup_task_aio(&main_task, com.aio_arg, 0);
 	 
 	rv = client_alloc();
 	if (rv < 0)
 		return rv;
 
-	memset(&act, 0, sizeof(act));
-	act.sa_handler = sigterm_handler;
-	rv = sigaction(SIGTERM, &act, NULL);
-	if (rv < 0)
-		return rv;
+	helper_ci = client_add(helper_status_fd, process_helper, helper_dead);
+	if (helper_ci < 0)
+		goto out_logging;
+	strcpy(client[helper_ci].owner_name, "helper");
 
-	fd = lockfile(SANLK_RUN_DIR, SANLK_LOCKFILE_NAME);
+	setup_signals();
+	setup_logging();
+
+	fd = lockfile(SANLK_RUN_DIR, SANLK_LOCKFILE_NAME, com.uid, com.gid);
 	if (fd < 0)
 		return fd;
-
-	setup_logging();
 
 	setup_host_name();
 
 	setup_groups();
 
-	log_error("sanlock daemon started %s aio %d %d renew %d %d host %s time %llu",
-		  RELEASE_VERSION,
-		  main_task.use_aio, main_task.io_timeout_seconds,
-		  main_task.id_renewal_seconds, main_task.id_renewal_fail_seconds,
-		  our_host_name_global,
-		  (unsigned long long)time(NULL));
+	log_level(0, 0, NULL, LOG_WARNING, "sanlock daemon started %s host %s",
+		  VERSION, our_host_name_global);
 
 	setup_priority();
 
 	rv = thread_pool_create(DEFAULT_MIN_WORKER_THREADS, com.max_worker_threads);
 	if (rv < 0)
 		goto out_logging;
-
-	rv = setup_watchdog();
-	if (rv < 0)
-		goto out_threads;
 
 	rv = setup_listener();
 	if (rv < 0)
@@ -1316,8 +1654,6 @@ static int do_daemon(void)
 	main_loop();
 
 	close_token_manager();
-
-	close_watchdog();
 
  out_threads:
 	thread_pool_free();
@@ -1430,9 +1766,10 @@ static void print_usage(void)
 	printf("  -U <uid>      user id\n");
 	printf("  -G <gid>      group id\n");
 	printf("  -t <num>      max worker threads (%d)\n", DEFAULT_MAX_WORKER_THREADS);
+	printf("  -g <sec>      seconds for graceful recovery (%d)\n", DEFAULT_GRACE_SEC);
 	printf("  -w 0|1        use watchdog through wdmd (%d)\n", DEFAULT_USE_WATCHDOG);
-	printf("  -h 0|1        use high priority features (%d)\n", DEFAULT_HIGH_PRIORITY);
-	printf("                (realtime scheduling, mlockall)\n");
+	printf("  -h 0|1        use high priority (RR) scheduling (%d)\n", DEFAULT_HIGH_PRIORITY);
+	printf("  -l <num>      use mlockall (0 none, 1 current, 2 current and future) (2)\n");
 	printf("  -a 0|1        use async io (%d)\n", DEFAULT_USE_AIO);
 	printf("  -o 0|1        io timeout in seconds (%d)\n", DEFAULT_IO_TIMEOUT);
 	printf("\n");
@@ -1490,7 +1827,7 @@ static int read_command_line(int argc, char *argv[])
 	char *p;
 	char *arg1 = argv[1];
 	char *act;
-	int i, j, len, begin_command = 0;
+	int i, j, len, sec, begin_command = 0;
 
 	if (argc < 2 || !strcmp(arg1, "help") || !strcmp(arg1, "--help") ||
 	    !strcmp(arg1, "-h")) {
@@ -1501,7 +1838,7 @@ static int read_command_line(int argc, char *argv[])
 	if (!strcmp(arg1, "version") || !strcmp(arg1, "--version") ||
 	    !strcmp(arg1, "-V")) {
 		printf("%s %s (built %s %s)\n",
-		       argv[0], RELEASE_VERSION, __DATE__, __TIME__);
+		       argv[0], VERSION, __DATE__, __TIME__);
 		exit(EXIT_SUCCESS);
 	}
 
@@ -1576,6 +1913,8 @@ static int read_command_line(int argc, char *argv[])
 			com.action = ACT_DIRECT_INIT;
 		else if (!strcmp(act, "dump"))
 			com.action = ACT_DUMP;
+		else if (!strcmp(act, "next_free"))
+			com.action = ACT_NEXT_FREE;
 		else if (!strcmp(act, "read_leader"))
 			com.action = ACT_READ_LEADER;
 		else if (!strcmp(act, "acquire"))
@@ -1600,8 +1939,8 @@ static int read_command_line(int argc, char *argv[])
 	};
 
 
-	/* the only action that has an option without dash-letter prefix */
-	if (com.action == ACT_DUMP) {
+	/* actions that have an option without dash-letter prefix */
+	if (com.action == ACT_DUMP || com.action == ACT_NEXT_FREE) {
 		if (argc < 4)
 			exit(EXIT_FAILURE);
 		optionarg = argv[i++];
@@ -1663,6 +2002,9 @@ static int read_command_line(int argc, char *argv[])
 		case 'h':
 			com.high_priority = atoi(optionarg);
 			break;
+		case 'l':
+			com.mlock_level = atoi(optionarg);
+			break;
 		case 'o':
 			if (com.action == ACT_STATUS) {
 				com.sort_arg = *optionarg;
@@ -1688,7 +2030,13 @@ static int read_command_line(int argc, char *argv[])
 			com.local_host_id = atoll(optionarg);
 			break;
 		case 'g':
-			com.local_host_generation = atoll(optionarg);
+			if (com.type == COM_DAEMON) {
+				sec = atoi(optionarg);
+				if (sec <= 60 && sec >= 0)
+					kill_grace_seconds = sec;
+			} else {
+				com.local_host_generation = atoll(optionarg);
+			}
 			break;
 		case 'f':
 			com.force_mode = strtoul(optionarg, NULL, 0);
@@ -1827,9 +2175,16 @@ static int do_client(void)
 		break;
 
 	case ACT_ADD_LOCKSPACE:
-		log_tool("add_lockspace");
-		rv = sanlock_add_lockspace(&com.lockspace, 0);
-		log_tool("add_lockspace done %d", rv);
+		if (com.io_timeout_arg != DEFAULT_IO_TIMEOUT) {
+			log_tool("add_lockspace_timeout %d", com.io_timeout_arg);
+			rv = sanlock_add_lockspace_timeout(&com.lockspace, 0,
+							   com.io_timeout_arg);
+			log_tool("add_lockspace_timeout done %d", rv);
+		} else {
+			log_tool("add_lockspace");
+			rv = sanlock_add_lockspace(&com.lockspace, 0);
+			log_tool("add_lockspace done %d", rv);
+		}
 		break;
 
 	case ACT_INQ_LOCKSPACE:
@@ -1939,14 +2294,13 @@ static int do_direct(void)
 	int live;
 	int rv;
 
-	setup_task_timeouts(&main_task, com.io_timeout_arg);
 	setup_task_aio(&main_task, com.aio_arg, DIRECT_AIO_CB_SIZE);
 	sprintf(main_task.name, "%s", "main_direct");
 
 	switch (com.action) {
 	case ACT_DIRECT_INIT:
-		rv = direct_init(&main_task, &com.lockspace, com.res_args[0],
-				 com.max_hosts, com.num_hosts);
+		rv = direct_init(&main_task, com.io_timeout_arg, &com.lockspace,
+				 com.res_args[0], com.max_hosts, com.num_hosts);
 		log_tool("init done %d", rv);
 		break;
 
@@ -1954,8 +2308,14 @@ static int do_direct(void)
 		rv = direct_dump(&main_task, com.dump_path, com.force_mode);
 		break;
 
+	case ACT_NEXT_FREE:
+		rv = direct_next_free(&main_task, com.dump_path);
+		break;
+
 	case ACT_READ_LEADER:
-		rv = direct_read_leader(&main_task, &com.lockspace, com.res_args[0], &leader);
+		rv = direct_read_leader(&main_task, com.io_timeout_arg,
+					&com.lockspace, com.res_args[0],
+					&leader);
 		log_tool("read_leader done %d", rv);
 		log_tool("magic 0x%0x", leader.magic);
 		log_tool("version 0x%x", leader.version);
@@ -1976,6 +2336,7 @@ static int do_direct(void)
 		log_tool("timestamp %llu",
 			 (unsigned long long)leader.timestamp);
 		log_tool("checksum 0x%0x", leader.checksum);
+		log_tool("io_timeout %u", leader.io_timeout);
 		log_tool("write_id %llu",
 			 (unsigned long long)leader.write_id);
 		log_tool("write_generation %llu",
@@ -1985,37 +2346,40 @@ static int do_direct(void)
 		break;
 
 	case ACT_ACQUIRE:
-		rv = direct_acquire(&main_task, com.res_args[0], com.num_hosts,
+		rv = direct_acquire(&main_task, com.io_timeout_arg,
+				    com.res_args[0], com.num_hosts,
 				    com.local_host_id, com.local_host_generation,
 				    &leader);
 		log_tool("acquire done %d", rv);
 		break;
 
 	case ACT_RELEASE:
-		rv = direct_release(&main_task, com.res_args[0], &leader);
+		rv = direct_release(&main_task, com.io_timeout_arg,
+				    com.res_args[0], &leader);
 		log_tool("release done %d", rv);
 		break;
 
 	case ACT_ACQUIRE_ID:
 		setup_host_name();
 
-		rv = direct_acquire_id(&main_task, &com.lockspace,
-				       our_host_name_global);
+		rv = direct_acquire_id(&main_task, com.io_timeout_arg,
+				       &com.lockspace, our_host_name_global);
 		log_tool("acquire_id done %d", rv);
 		break;
 
 	case ACT_RELEASE_ID:
-		rv = direct_release_id(&main_task, &com.lockspace);
+		rv = direct_release_id(&main_task, com.io_timeout_arg, &com.lockspace);
 		log_tool("release_id done %d", rv);
 		break;
 
 	case ACT_RENEW_ID:
-		rv = direct_renew_id(&main_task, &com.lockspace);
+		rv = direct_renew_id(&main_task, com.io_timeout_arg, &com.lockspace);
 		log_tool("rewew_id done %d", rv);
 		break;
 
 	case ACT_READ_ID:
 		rv = direct_read_id(&main_task,
+				    com.io_timeout_arg,
 				    &com.lockspace,
 				    &timestamp,
 				    &owner_id,
@@ -2030,6 +2394,7 @@ static int do_direct(void)
 
 	case ACT_LIVE_ID:
 		rv = direct_live_id(&main_task,
+				    com.io_timeout_arg,
 				    &com.lockspace,
 				    &timestamp,
 				    &owner_id,
@@ -2058,16 +2423,26 @@ int main(int argc, char *argv[])
 
 	BUILD_BUG_ON(sizeof(struct sanlk_disk) != sizeof(struct sync_disk));
 	BUILD_BUG_ON(sizeof(struct leader_record) > LEADER_RECORD_MAX);
+	BUILD_BUG_ON(sizeof(struct helper_msg) != SANLK_HELPER_MSG_LEN);
 
-	/* initialize global variables */
+	/* initialize global EXTERN variables */
+
+	kill_count_max = 100;
+	kill_grace_seconds = DEFAULT_GRACE_SEC;
+	helper_ci = -1;
+	helper_pid = -1;
+	helper_kill_fd = -1;
+	helper_status_fd = -1;
+	
 	pthread_mutex_init(&spaces_mutex, NULL);
 	INIT_LIST_HEAD(&spaces);
 	INIT_LIST_HEAD(&spaces_rem);
 	INIT_LIST_HEAD(&spaces_add);
-	
+
 	memset(&com, 0, sizeof(com));
 	com.use_watchdog = DEFAULT_USE_WATCHDOG;
 	com.high_priority = DEFAULT_HIGH_PRIORITY;
+	com.mlock_level = DEFAULT_MLOCK_LEVEL;
 	com.max_worker_threads = DEFAULT_MAX_WORKER_THREADS;
 	com.io_timeout_arg = DEFAULT_IO_TIMEOUT;
 	com.aio_arg = DEFAULT_USE_AIO;

@@ -21,12 +21,14 @@ CMD_SOURCE = \
 	delta_lease.c \
 	direct.c \
 	diskio.c \
+	helper.c \
 	lockspace.c \
 	lockfile.c \
 	log.c \
 	main.c \
 	paxos_lease.c \
 	task.c \
+	timeouts.c \
 	resource.c \
 	watchdog.c \
 	monotime.c \
@@ -43,6 +45,7 @@ LIB_ENTIRE_SOURCE = \
 	paxos_lease.c \
 	direct.c \
 	task.c \
+	timeouts.c \
 	direct_lib.c \
 	monotime.c
 
@@ -70,6 +73,9 @@ CFLAGS += -D_GNU_SOURCE -g \
 	-fasynchronous-unwind-tables \
 	-fdiagnostics-show-option
 
+VER=$(shell cat ../VERSION)
+CFLAGS += -DVERSION=\"$(VER)\"
+
 CMD_CFLAGS = $(CFLAGS) -fPIE -DPIE
 
 CMD_LDFLAGS += -Wl,-z,now -Wl,-z,relro -pie
@@ -79,7 +85,6 @@ LIB_ENTIRE_LDFLAGS += -lpthread -lrt -laio -lblkid -L../wdmd -lwdmd
 LIB_ENTIRE_LDFLAGS += -Wl,-z,relro -pie
 
 LIB_CLIENT_LDFLAGS += -Wl,-z,relro -pie
-
 
 all: $(LIBSO_ENTIRE_TARGET) $(LIBSO_CLIENT_TARGET) $(CMD_TARGET)
 

@@ -28,6 +28,7 @@
 #include "log.h"
 #include "paxos_lease.h"
 #include "delta_lease.h"
+#include "timeouts.h"
 
 /* Based on "Light-Weight Leases for Storage-Centric Coordination"
    by Gregory Chockler and Dahlia Malkhi */
@@ -147,7 +148,7 @@ static int verify_leader(struct sync_disk *disk,
 	return result;
 }
 
-int delta_lease_leader_read(struct task *task,
+int delta_lease_leader_read(struct task *task, int io_timeout,
 			    struct sync_disk *disk,
 			    char *space_name,
 			    uint64_t host_id,
@@ -163,7 +164,7 @@ int delta_lease_leader_read(struct task *task,
 	memset(leader_ret, 0, sizeof(struct leader_record));
 
 	rv = read_sectors(disk, host_id - 1, 1, (char *)&leader, sizeof(struct leader_record),
-			  task, "delta_leader");
+			  task, io_timeout, "delta_leader");
 	if (rv < 0)
 		return rv;
 
@@ -199,21 +200,34 @@ int delta_lease_acquire(struct task *task,
 	struct leader_record leader;
 	struct leader_record leader1;
 	uint64_t new_ts;
+	int other_io_timeout, other_host_dead_seconds, other_id_renewal_seconds;
 	int i, error, rv, delay, delta_large_delay;
 
-	log_space(sp, "delta_acquire %llu begin", (unsigned long long)host_id);
+	log_space(sp, "delta_acquire begin %.48s:%llu",
+		  sp->space_name, (unsigned long long)host_id);
 
-	error = delta_lease_leader_read(task, disk, space_name, host_id, &leader,
+	error = delta_lease_leader_read(task, sp->io_timeout, disk, space_name, host_id, &leader,
 					"delta_acquire_begin");
-	if (error < 0)
+	if (error < 0) {
+		log_space(sp, "delta_acquire leader_read1 error %d", error);
 		return error;
+	}
+
+	other_io_timeout = leader.io_timeout;
+
+	if (!other_io_timeout) {
+		log_erros(sp, "delta_acquire use own io_timeout %d", sp->io_timeout);
+		other_io_timeout = sp->io_timeout;
+	} else if (other_io_timeout != sp->io_timeout) {
+		log_erros(sp, "delta_acquire other_io_timeout %u our %u",
+			  leader.io_timeout, sp->io_timeout);
+	}
 
 	if (leader.timestamp == LEASE_FREE)
 		goto write_new;
 
 	if (!strncmp(leader.resource_name, our_host_name, NAME_ID_SIZE)) {
-		log_space(sp, "delta_acquire %llu fast reacquire",
-			  (unsigned long long)host_id);
+		log_space(sp, "delta_acquire fast reacquire");
 		goto write_new;
 	}
 
@@ -235,30 +249,45 @@ int delta_lease_acquire(struct task *task,
 	 * we use here must be the max of the delta delay (D+6d) and
 	 * host_dead_seconds */
 
-	delay = task->host_dead_seconds;
-	delta_large_delay = task->id_renewal_seconds + (6 * task->io_timeout_seconds);
+	/*
+	 * delay = task->host_dead_seconds;
+	 * delta_large_delay = task->id_renewal_seconds + (6 * task->io_timeout_seconds);
+	 * if (delta_large_delay > delay)
+	 * 	delay = delta_large_delay;
+	 */
+
+	other_host_dead_seconds = calc_host_dead_seconds(other_io_timeout);
+	other_id_renewal_seconds = calc_id_renewal_seconds(other_io_timeout);
+
+	delay = other_host_dead_seconds;
+	delta_large_delay = other_id_renewal_seconds + (6 * other_io_timeout);
 	if (delta_large_delay > delay)
 		delay = delta_large_delay;
 
 	while (1) {
 		memcpy(&leader1, &leader, sizeof(struct leader_record));
 
-		log_space(sp, "delta_acquire %llu delta_large_delay %d delay %d",
-			  (unsigned long long)host_id, delta_large_delay, delay);
+		log_space(sp, "delta_acquire delta_large_delay %d delay %d",
+			  delta_large_delay, delay);
 
 		/* TODO: we could reread every several seconds to see if
 		   it has changed, so we can abort more quickly if so */
 
 		for (i = 0; i < delay; i++) {
-			if (sp->external_remove || external_shutdown)
+			if (sp->external_remove || external_shutdown) {
+				log_space(sp, "delta_acquire abort1 remove %d shutdown %d",
+					  sp->external_remove, external_shutdown);
 				return SANLK_ERROR;
+			}
 			sleep(1);
 		}
 
-		error = delta_lease_leader_read(task, disk, space_name, host_id,
+		error = delta_lease_leader_read(task, sp->io_timeout, disk, space_name, host_id,
 						&leader, "delta_acquire_wait");
-		if (error < 0)
+		if (error < 0) {
+			log_space(sp, "delta_acquire leader_read2 error %d", error);
 			return error;
+		}
 
 		if (!memcmp(&leader1, &leader, sizeof(struct leader_record)))
 			break;
@@ -266,7 +295,7 @@ int delta_lease_acquire(struct task *task,
 		if (leader.timestamp == LEASE_FREE)
 			break;
 
-		log_erros(sp, "delta_acquire %llu busy %llu %llu %llu %.48s",
+		log_erros(sp, "delta_acquire host_id %llu busy1 %llu %llu %llu %.48s",
 			  (unsigned long long)host_id,
 			  (unsigned long long)leader.owner_id,
 			  (unsigned long long)leader.owner_generation,
@@ -278,42 +307,48 @@ int delta_lease_acquire(struct task *task,
  write_new:
 	new_ts = monotime();
 	leader.timestamp = new_ts;
+	leader.io_timeout = (sp->io_timeout & 0x00FF);
 	leader.owner_id = host_id;
 	leader.owner_generation++;
 	snprintf(leader.resource_name, NAME_ID_SIZE, "%s", our_host_name);
 	leader.checksum = leader_checksum(&leader);
 
-	log_space(sp, "delta_acquire %llu write %llu %llu %llu %.48s",
-		  (unsigned long long)host_id,
+	log_space(sp, "delta_acquire write %llu %llu %llu %.48s",
 		  (unsigned long long)leader.owner_id,
 		  (unsigned long long)leader.owner_generation,
 		  (unsigned long long)leader.timestamp,
 		  leader.resource_name);
 
 	rv = write_sector(disk, host_id - 1, (char *)&leader, sizeof(struct leader_record),
-			  task, "delta_leader");
-	if (rv < 0)
+			  task, sp->io_timeout, "delta_leader");
+	if (rv < 0) {
+		log_space(sp, "delta_acquire write error %d", rv);
 		return rv;
+	}
 
 	memcpy(&leader1, &leader, sizeof(struct leader_record));
 
-	delay = 2 * task->io_timeout_seconds;
-	log_space(sp, "delta_acquire %llu delta_short_delay %d",
-		  (unsigned long long)host_id, delay);
+	delay = 2 * other_io_timeout;
+	log_space(sp, "delta_acquire delta_short_delay %d", delay);
 
 	for (i = 0; i < delay; i++) {
-		if (sp->external_remove || external_shutdown)
+		if (sp->external_remove || external_shutdown) {
+			log_space(sp, "delta_acquire abort2 remove %d shutdown %d",
+				  sp->external_remove, external_shutdown);
 			return SANLK_ERROR;
+		}
 		sleep(1);
 	}
 
-	error = delta_lease_leader_read(task, disk, space_name, host_id, &leader,
+	error = delta_lease_leader_read(task, sp->io_timeout, disk, space_name, host_id, &leader,
 					"delta_acquire_check");
-	if (error < 0)
+	if (error < 0) {
+		log_space(sp, "delta_acquire leader_read3 error %d", error);
 		return error;
+	}
 
 	if (memcmp(&leader1, &leader, sizeof(struct leader_record))) {
-		log_erros(sp, "delta_acquire %llu busy %llu %llu %llu %.48s",
+		log_erros(sp, "delta_acquire host_id %llu busy2 %llu %llu %llu %.48s",
 			  (unsigned long long)host_id,
 			  (unsigned long long)leader.owner_id,
 			  (unsigned long long)leader.owner_generation,
@@ -321,6 +356,11 @@ int delta_lease_acquire(struct task *task,
 			  leader.resource_name);
 		return SANLK_HOSTID_BUSY;
 	}
+
+	log_space(sp, "delta_acquire done %llu %llu %llu",
+		  (unsigned long long)leader.owner_id,
+		  (unsigned long long)leader.owner_generation,
+		  (unsigned long long)leader.timestamp);
 
 	memcpy(leader_ret, &leader, sizeof(struct leader_record));
 	return SANLK_OK;
@@ -341,10 +381,12 @@ int delta_lease_renew(struct task *task,
 	char **p_wbuf;
 	char *wbuf;
 	uint64_t host_id, id_offset, new_ts;
-	int rv, iobuf_len, sector_size, io_timeout_save;
+	int rv, iobuf_len, sector_size;
 
-	if (!leader_last)
+	if (!leader_last) {
+		log_erros(sp, "delta_renew no leader_last");
 		return -EINVAL;
+	}
 
 	*read_result = SANLK_ERROR;
 
@@ -356,9 +398,11 @@ int delta_lease_renew(struct task *task,
 
 	/* offset of our leader_record */
 	id_offset = (host_id - 1) * sector_size;
-	if (id_offset > iobuf_len)
+	if (id_offset > iobuf_len) {
+		log_erros(sp, "delta_renew bad offset %llu iobuf_len %d",
+			  (unsigned long long)id_offset, iobuf_len);
 		return -EINVAL;
-
+	}
 
 	/* if the previous renew timed out in this initial read, and that read
 	   is now complete, we can use that result here instead of discarding
@@ -378,8 +422,9 @@ int delta_lease_renew(struct task *task,
 			goto skip_reap;
 		}
 
+		/* only wait .5 sec when trying to reap a prev io */
 		rv = read_iobuf_reap(disk->fd, disk->offset,
-				     task->iobuf, iobuf_len, task);
+				     task->iobuf, iobuf_len, task, 500000000);
 
 		log_space(sp, "delta_renew reap %d", rv);
 
@@ -425,7 +470,7 @@ int delta_lease_renew(struct task *task,
 		}
 	}
 
-	rv = read_iobuf(disk->fd, disk->offset, task->iobuf, iobuf_len, task);
+	rv = read_iobuf(disk->fd, disk->offset, task->iobuf, iobuf_len, task, sp->io_timeout);
 	if (rv) {
 		/* the next time delta_lease_renew() is called, prev_result
 		   will be this rv.  If this rv is SANLK_AIO_TIMEOUT, we'll
@@ -441,8 +486,10 @@ int delta_lease_renew(struct task *task,
 	memcpy(&leader, task->iobuf+id_offset, sizeof(struct leader_record));
 
 	rv = verify_leader(disk, space_name, host_id, &leader, "delta_renew");
-	if (rv < 0)
+	if (rv < 0) {
+		log_erros(sp, "delta_renew verify_leader error %d", rv);
 		return rv;
+	}
 
 	/* We can't always memcmp(&leader, leader_last) because previous writes
 	   may have timed out and we don't know if they were actually written
@@ -464,6 +511,12 @@ int delta_lease_renew(struct task *task,
 		log_leader_error(0, space_name, host_id, disk, leader_last, "delta_renew_last");
 		log_leader_error(0, space_name, host_id, disk, &leader, "delta_renew_read");
 		return SANLK_RENEW_DIFF;
+	}
+
+	if (leader.io_timeout != sp->io_timeout) {
+		log_erros(sp, "delta_renew io_timeout changed disk %d sp %d",
+			  leader.io_timeout, sp->io_timeout);
+		leader.io_timeout = (sp->io_timeout & 0x00FF);
 	}
 
 	new_ts = monotime();
@@ -490,18 +543,16 @@ int delta_lease_renew(struct task *task,
 	   out.  there's nothing we would do but retry it, and timing out and
 	   retrying unnecessarily would probably be counter productive. */
 
-	io_timeout_save = task->io_timeout_seconds;
-	task->io_timeout_seconds = task->host_dead_seconds;
-
-	rv = write_iobuf(disk->fd, disk->offset+id_offset, wbuf, sector_size, task);
+	rv = write_iobuf(disk->fd, disk->offset+id_offset, wbuf, sector_size, task,
+			 calc_host_dead_seconds(sp->io_timeout));
 
 	if (rv != SANLK_AIO_TIMEOUT)
 		free(wbuf);
 
-	task->io_timeout_seconds = io_timeout_save;
-
-	if (rv < 0)
+	if (rv < 0) {
+		log_erros(sp, "delta_renew write error %d", rv);
 		return rv;
+	}
 
 	/* the paper shows doing a delay and another read here, but it seems
 	   unnecessary since we do the same at the beginning of the next renewal */
@@ -526,16 +577,24 @@ int delta_lease_release(struct task *task,
 
 	host_id = leader_last->owner_id;
 
-	log_space(sp, "delta_release %llu begin", (unsigned long long)host_id);
+	log_space(sp, "delta_release begin %.48s:%llu",
+		  sp->space_name, (unsigned long long)host_id);
 
 	memcpy(&leader, leader_last, sizeof(struct leader_record));
 	leader.timestamp = LEASE_FREE;
 	leader.checksum = leader_checksum(&leader);
 
 	rv = write_sector(disk, host_id - 1, (char *)&leader, sizeof(struct leader_record),
-			  task, "delta_leader");
-	if (rv < 0)
+			  task, sp->io_timeout, "delta_leader");
+	if (rv < 0) {
+		log_space(sp, "delta_release write error %d", rv);
 		return rv;
+	}
+
+	log_space(sp, "delta_release done %llu %llu %llu",
+		  (unsigned long long)leader.owner_id,
+		  (unsigned long long)leader.owner_generation,
+		  (unsigned long long)leader.timestamp);
 
 	memcpy(leader_ret, &leader, sizeof(struct leader_record));
 	return SANLK_OK;
@@ -545,6 +604,7 @@ int delta_lease_release(struct task *task,
    block device disk->path */
 
 int delta_lease_init(struct task *task,
+		     int io_timeout,
 		     struct sync_disk *disk,
 		     char *space_name,
 		     int max_hosts)
@@ -584,11 +644,12 @@ int delta_lease_init(struct task *task,
 		leader->sector_size = disk->sector_size;
 		leader->max_hosts = 1;
 		leader->timestamp = LEASE_FREE;
+		leader->io_timeout = io_timeout;
 		strncpy(leader->space_name, space_name, NAME_ID_SIZE);
 		leader->checksum = leader_checksum(leader);
 	}
 
-	rv = write_iobuf(disk->fd, disk->offset, iobuf, iobuf_len, task);
+	rv = write_iobuf(disk->fd, disk->offset, iobuf, iobuf_len, task, io_timeout);
 
 	if (rv != SANLK_AIO_TIMEOUT)
 		free(iobuf);

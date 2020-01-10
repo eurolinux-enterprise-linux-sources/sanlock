@@ -30,7 +30,9 @@
 #include "lockspace.h"
 #include "resource.h"
 #include "task.h"
+#include "timeouts.h"
 #include "mode_block.h"
+#include "helper.h"
 
 /* from cmd.c */
 void send_state_resource(int fd, struct resource *r, const char *list_name, int pid, uint32_t token_id);
@@ -74,10 +76,11 @@ void send_state_resources(int fd)
    enough knowledge to say it's safely dead (unless of course we find it is
    alive while waiting) */
 
-static int host_live(struct task *task, char *lockspace_name, uint64_t host_id, uint64_t gen)
+static int host_live(char *lockspace_name, uint64_t host_id, uint64_t gen)
 {
 	struct host_status hs;
 	uint64_t now;
+	int other_io_timeout, other_host_dead_seconds;
 	int rv;
 
 	rv = host_info(lockspace_name, host_id, &hs);
@@ -109,14 +112,17 @@ static int host_live(struct task *task, char *lockspace_name, uint64_t host_id, 
 
 	now = monotime();
 
-	if (!hs.last_live && (now - hs.first_check > task->host_dead_seconds)) {
+	other_io_timeout = hs.io_timeout;
+	other_host_dead_seconds = calc_host_dead_seconds(other_io_timeout);
+
+	if (!hs.last_live && (now - hs.first_check > other_host_dead_seconds)) {
 		log_debug("host_live %llu %llu no first_check %llu",
 			  (unsigned long long)host_id, (unsigned long long)gen,
 			  (unsigned long long)hs.first_check);
 		return 0;
 	}
 
-	if (hs.last_live && (now - hs.last_live > task->host_dead_seconds)) {
+	if (hs.last_live && (now - hs.last_live > other_host_dead_seconds)) {
 		log_debug("host_live %llu %llu no last_live %llu",
 			  (unsigned long long)host_id, (unsigned long long)gen,
 			  (unsigned long long)hs.last_live);
@@ -170,7 +176,7 @@ static int set_mode_block(struct task *task, struct token *token,
 
 		offset = disk->offset + ((2 + host_id - 1) * disk->sector_size);
 
-		rv = read_iobuf(disk->fd, offset, iobuf, iobuf_len, task);
+		rv = read_iobuf(disk->fd, offset, iobuf, iobuf_len, task, token->io_timeout);
 		if (rv < 0)
 			break;
 
@@ -178,7 +184,7 @@ static int set_mode_block(struct task *task, struct token *token,
 		mb->flags = flags;
 		mb->generation = gen;
 
-		rv = write_iobuf(disk->fd, offset, iobuf, iobuf_len, task);
+		rv = write_iobuf(disk->fd, offset, iobuf, iobuf_len, task, token->io_timeout);
 		if (rv < 0)
 			break;
 	}
@@ -224,7 +230,7 @@ static int read_mode_block(struct task *task, struct token *token,
 
 		offset = disk->offset + ((2 + host_id - 1) * disk->sector_size);
 
-		rv = read_iobuf(disk->fd, offset, iobuf, iobuf_len, task);
+		rv = read_iobuf(disk->fd, offset, iobuf, iobuf_len, task, token->io_timeout);
 		if (rv < 0)
 			break;
 
@@ -266,7 +272,7 @@ static int clear_dead_shared(struct task *task, struct token *token,
 			return rv;
 		}
 
-		if (host_live(task, token->r.lockspace_name, host_id, max_gen)) {
+		if (host_live(token->r.lockspace_name, host_id, max_gen)) {
 			log_token(token, "clear_dead_shared host_id %llu gen %llu alive",
 				  (unsigned long long)host_id, (unsigned long long)max_gen);
 			live++;
@@ -375,6 +381,13 @@ static int _release_token(struct task *task, struct token *token, int opened, in
 
 	if (!lver) {
 		/* never acquired on disk so no need to release on disk */
+		close_disks(token->disks, token->r.num_disks);
+		rv = SANLK_OK;
+		goto out;
+	}
+
+	if (token->flags & T_LS_DEAD) {
+		/* don't bother trying disk op which will probably timeout */
 		close_disks(token->disks, token->r.num_disks);
 		rv = SANLK_OK;
 		goto out;
@@ -535,6 +548,8 @@ static struct resource *new_resource(struct token *token)
 	memset(r, 0, r_len);
 	memcpy(&r->r, &token->r, sizeof(struct sanlk_resource));
 
+	r->io_timeout = token->io_timeout;
+
 	/* disks copied after open_disks because open_disks sets sector_size
 	   which we want copied */
 
@@ -653,6 +668,10 @@ int acquire_token(struct task *task, struct token *token)
 	}
 
 	memcpy(&r->leader, &leader, sizeof(struct leader_record));
+
+	/* copy lver into token because inquire looks there for it */
+	if (!(token->acquire_flags & SANLK_RES_SHARED))
+		token->r.lver = leader.lver;
 
 	if (token->acquire_flags & SANLK_RES_SHARED) {
 		rv = set_mode_block(task, token, token->host_id,
@@ -799,11 +818,12 @@ static int examine_token(struct task *task, struct token *token,
 	return rv;
 }
 
-static void do_req_kill_pid(struct token *tt, int pid)
+static void do_request(struct token *tt, int pid, uint32_t force_mode)
 {
+	struct helper_msg hm;
 	struct resource *r;
 	uint32_t flags;
-	int found = 0;
+	int rv, found = 0;
 
 	pthread_mutex_lock(&resource_mutex);
 	r = find_resource(tt, &resources_held);
@@ -814,24 +834,56 @@ static void do_req_kill_pid(struct token *tt, int pid)
 	pthread_mutex_unlock(&resource_mutex);
 
 	if (!found) {
-		log_error("req pid %d %.48s:%.48s not found",
+		log_error("do_request pid %d %.48s:%.48s not found",
 			   pid, tt->r.lockspace_name, tt->r.name);
 		return;
 	}
 
-	log_debug("do_req_kill_pid %d flags %x %.48s:%.48s",
+	log_debug("do_request %d flags %x %.48s:%.48s",
 		  pid, flags, tt->r.lockspace_name, tt->r.name);
 
-	/* TODO: share code with kill_pids() to gradually
-	 * escalate from killscript, SIGTERM, SIGKILL */
-
-	kill(pid, SIGTERM);
-
-	if (flags & R_RESTRICT_SIGKILL)
+	if (helper_kill_fd == -1) {
+		log_error("do_request %d no helper fd", pid);
 		return;
+	}
 
-	sleep(1);
-	kill(pid, SIGKILL);
+	memset(&hm, 0, sizeof(hm));
+
+	if (force_mode == SANLK_REQ_KILL_PID) {
+		hm.type = HELPER_MSG_KILLPID;
+		hm.pid = pid;
+		hm.sig = (flags & R_RESTRICT_SIGKILL) ? SIGTERM : SIGKILL;
+	} else if (force_mode == SANLK_REQ_SIGUSR1) {
+		hm.type = HELPER_MSG_KILLPID;
+		hm.pid = pid;
+		hm.sig = SIGUSR1;
+	} else {
+		log_error("do_request %d unknown force_mode %d",
+			  pid, force_mode);
+		return;
+	}
+#if 0
+	/* TODO: this is difficult because we can't dig into the clients
+	   array to get the killpath/killargs; the clients array is not
+	   locked and can only be accessed by the main thread. */
+
+	else if (force_mode == SANLK_REQ_KILLPATH) {
+		hm.type = HELPER_MSG_RUNPATH;
+		memcpy(hm.path, cl->killpath, SANLK_HELPER_PATH_LEN);
+		memcpy(hm.args, cl->killargs, SANLK_HELPER_ARGS_LEN);
+		if (cl->flags & CL_KILLPATH_PID)
+			hm.pid = pid;
+	}
+#endif
+
+ retry:
+	rv = write(helper_kill_fd, &hm, sizeof(hm));
+	if (rv == -1 && errno == EINTR)
+		goto retry;
+
+	if (rv == -1)
+		log_error("do_request %d helper write error %d",
+			  pid, errno);
 }
 
 int set_resource_examine(char *space_name, char *res_name)
@@ -924,8 +976,8 @@ static void resource_thread_examine(struct task *task, struct token *tt, int pid
 		return;
 	}
 
-	if (req.force_mode == SANLK_REQ_KILL_PID) {
-		do_req_kill_pid(tt, pid);
+	if (req.force_mode) {
+		do_request(tt, pid, req.force_mode);
 	} else {
 		log_error("req force_mode %u unknown", req.force_mode);
 	}
@@ -940,7 +992,6 @@ static void *resource_thread(void *arg GNUC_UNUSED)
 	int pid, tt_len;
 
 	memset(&task, 0, sizeof(struct task));
-	setup_task_timeouts(&task, main_task.io_timeout_seconds);
 	setup_task_aio(&task, main_task.use_aio, RESOURCE_AIO_CB_SIZE);
 	sprintf(task.name, "%s", "resource");
 
@@ -979,6 +1030,7 @@ static void *resource_thread(void *arg GNUC_UNUSED)
 			tt->host_id = r->host_id;
 			tt->host_generation = r->host_generation;
 			tt->token_id = r->release_token_id;
+			tt->io_timeout = r->io_timeout;
 
 			r->flags &= ~R_THREAD_RELEASE;
 			pthread_mutex_unlock(&resource_mutex);
@@ -996,6 +1048,7 @@ static void *resource_thread(void *arg GNUC_UNUSED)
 			copy_disks(&tt->r.disks, &r->r.disks, r->r.num_disks);
 			tt->host_id = r->host_id;
 			tt->host_generation = r->host_generation;
+			tt->io_timeout = r->io_timeout;
 			pid = r->pid;
 			lver = r->leader.lver;
 

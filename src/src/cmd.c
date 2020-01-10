@@ -88,7 +88,7 @@ static int check_new_tokens_space(struct client *cl,
 				  struct token *new_tokens[],
 				  int new_tokens_count)
 {
-	struct space space;
+	struct space_info spi;
 	struct token *token;
 	int i, rv, empty_slots = 0;
 
@@ -107,9 +107,9 @@ static int check_new_tokens_space(struct client *cl,
 	for (i = 0; i < new_tokens_count; i++) {
 		token = new_tokens[i];
 
-		rv = _lockspace_info(token->r.lockspace_name, &space);
+		rv = _lockspace_info(token->r.lockspace_name, &spi);
 
-		if (!rv && !space.killing_pids && space.host_id == token->host_id)
+		if (!rv && !spi.killing_pids && spi.host_id == token->host_id)
 			continue;
 
 		return -ENOSPC;
@@ -125,7 +125,7 @@ static void cmd_acquire(struct task *task, struct cmd_args *ca)
 	struct token *new_tokens[SANLK_MAX_RESOURCES];
 	struct sanlk_resource res;
 	struct sanlk_options opt;
-	struct space space;
+	struct space_info spi;
 	char *opt_str;
 	int token_len, disks_len;
 	int fd, rv, i, j, empty_slots, lvl;
@@ -290,23 +290,24 @@ static void cmd_acquire(struct task *task, struct cmd_args *ca)
 
 	for (i = 0; i < new_tokens_count; i++) {
 		token = new_tokens[i];
-		rv = lockspace_info(token->r.lockspace_name, &space);
-		if (rv < 0 || space.killing_pids) {
+		rv = lockspace_info(token->r.lockspace_name, &spi);
+		if (rv < 0 || spi.killing_pids) {
 			log_errot(token, "cmd_acquire %d,%d,%d invalid lockspace "
 				  "found %d failed %d name %.48s",
-				  cl_ci, cl_fd, cl_pid, rv, space.killing_pids,
+				  cl_ci, cl_fd, cl_pid, rv, spi.killing_pids,
 				  token->r.lockspace_name);
 			result = -ENOSPC;
 			goto done;
 		}
-		token->host_id = space.host_id;
-		token->host_generation = space.host_generation;
+		token->host_id = spi.host_id;
+		token->host_generation = spi.host_generation;
 		token->pid = cl_pid;
-		if (cl->restrict & SANLK_RESTRICT_SIGKILL)
+		token->io_timeout = spi.io_timeout;
+		if (cl->restricted & SANLK_RESTRICT_SIGKILL)
 			token->flags |= T_RESTRICT_SIGKILL;
 
 		/* save a record of what this token_id is for later debugging */
-		log_level(space.space_id, token->token_id, NULL, LOG_WARNING,
+		log_level(spi.space_id, token->token_id, NULL, LOG_WARNING,
 			  "resource %.48s:%.48s:%.256s:%llu%s for %d,%d,%d",
 			  token->r.lockspace_name,
 			  token->r.name,
@@ -554,6 +555,34 @@ static void cmd_release(struct task *task, struct cmd_args *ca)
 
 	pid_dead = cl->pid_dead;
 	cl->cmd_active = 0;
+
+	if (!pid_dead && cl->kill_count) {
+		/*
+		 * If no tokens are left, clear all cl killing state.  The
+		 * cl no longer needs to be killed, and the pid may continue
+		 * running, even if a failed lockspace it was using is
+		 * released.  When the lockspace is re-added, the tokens
+		 * may be re-acquired for this same cl/pid.
+		 */
+
+		found = 0;
+
+		for (j = 0; j < SANLK_MAX_RESOURCES; j++) {
+			if (!cl->tokens[j])
+				continue;
+			found = 1;
+			break;
+		}
+
+		if (!found) {
+			cl->kill_count = 0;
+			cl->kill_last = 0;
+			cl->flags &= ~CL_RUNPATH_SENT;
+
+			log_debug("cmd_release %d,%d,%d clear kill state",
+				  cl_ci, cl_fd, cl_pid);
+		}
+	}
 	pthread_mutex_unlock(&cl->mutex);
 
 	if (pid_dead) {
@@ -700,6 +729,7 @@ static void cmd_request(struct task *task, struct cmd_args *ca)
 {
 	struct token *token;
 	struct sanlk_resource res;
+	struct space_info spi;
 	uint64_t owner_id;
 	uint32_t force_mode;
 	int token_len, disks_len;
@@ -770,6 +800,14 @@ static void cmd_request(struct task *task, struct cmd_args *ca)
 		  token->r.name,
 		  token->disks[0].path,
 		  (unsigned long long)token->r.disks[0].offset);
+
+	rv = lockspace_info(token->r.lockspace_name, &spi);
+	if (rv < 0 || spi.killing_pids) {
+		result = -ENOSPC;
+		goto reply_free;
+	}
+
+	token->io_timeout = spi.io_timeout;
 
 	error = request_token(task, token, force_mode, &owner_id);
 	if (error < 0) {
@@ -846,6 +884,7 @@ static void cmd_add_lockspace(struct cmd_args *ca)
 {
 	struct sanlk_lockspace lockspace;
 	struct space *sp;
+	uint32_t io_timeout;
 	int async = ca->header.cmd_flags & SANLK_ADD_ASYNC;
 	int fd, rv, result;
 
@@ -859,14 +898,18 @@ static void cmd_add_lockspace(struct cmd_args *ca)
 		goto reply;
 	}
 
-	log_debug("cmd_add_lockspace %d,%d %.48s:%llu:%s:%llu flags %x",
+	log_debug("cmd_add_lockspace %d,%d %.48s:%llu:%s:%llu flags %x timeout %u",
 		  ca->ci_in, fd, lockspace.name,
 		  (unsigned long long)lockspace.host_id,
 		  lockspace.host_id_disk.path,
 		  (unsigned long long)lockspace.host_id_disk.offset,
-		  ca->header.cmd_flags);
+		  ca->header.cmd_flags, ca->header.data);
 
-	rv = add_lockspace_start(&lockspace, &sp);
+	io_timeout = ca->header.data;
+	if (!io_timeout)
+		io_timeout = DEFAULT_IO_TIMEOUT;
+
+	rv = add_lockspace_start(&lockspace, io_timeout, &sp);
 	if (rv < 0) {
 		result = rv;
 		goto reply;
@@ -891,6 +934,7 @@ static void cmd_add_lockspace(struct cmd_args *ca)
 static void cmd_inq_lockspace(struct cmd_args *ca)
 {
 	struct sanlk_lockspace lockspace;
+	int waitrs = ca->header.cmd_flags & SANLK_INQ_WAIT;
 	int fd, rv, result;
 
 	fd = client[ca->ci_in].fd;
@@ -903,13 +947,21 @@ static void cmd_inq_lockspace(struct cmd_args *ca)
 		goto reply;
 	}
 
-	log_debug("cmd_inq_lockspace %d,%d %.48s:%llu:%s:%llu",
+	log_debug("cmd_inq_lockspace %d,%d %.48s:%llu:%s:%llu flags %x",
 		  ca->ci_in, fd, lockspace.name,
 		  (unsigned long long)lockspace.host_id,
 		  lockspace.host_id_disk.path,
-		  (unsigned long long)lockspace.host_id_disk.offset);
+		  (unsigned long long)lockspace.host_id_disk.offset,
+		  ca->header.cmd_flags);
 
-	result = inq_lockspace(&lockspace);
+	while (1) {
+		result = inq_lockspace(&lockspace);
+		if ((result != -EINPROGRESS) || !(waitrs)) {
+			break;
+		}
+		sleep(1);
+	}
+
  reply:
 	log_debug("cmd_inq_lockspace %d,%d done %d", ca->ci_in, fd, result);
 
@@ -1091,7 +1143,7 @@ static void cmd_init_lockspace(struct task *task, struct cmd_args *ca)
 		goto reply;
 	}
 
-	result = delta_lease_init(task, &sd, lockspace.name, ca->header.data);
+	result = delta_lease_init(task, DEFAULT_IO_TIMEOUT, &sd, lockspace.name, ca->header.data);
 
 	close_disks(&sd, 1);
  reply:
@@ -1172,6 +1224,8 @@ static void cmd_init_resource(struct task *task, struct cmd_args *ca)
 		goto reply;
 	}
 
+	token->io_timeout = DEFAULT_IO_TIMEOUT;
+
 	result = paxos_lease_init(task, token, ca->header.data, ca->header.data2);
 
 	close_disks(token->disks, token->r.num_disks);
@@ -1181,6 +1235,67 @@ static void cmd_init_resource(struct task *task, struct cmd_args *ca)
 	log_debug("cmd_init_resource %d,%d done %d", ca->ci_in, fd, result);
 
 	send_result(fd, &ca->header, result);
+	client_resume(ca->ci_in);
+}
+
+/* N.B. the api doesn't support one client setting killpath for another
+   pid/client */
+
+static void cmd_killpath(struct task *task, struct cmd_args *ca)
+{
+	struct client *cl;
+	int cl_ci = ca->ci_target;
+	int cl_fd = ca->cl_fd;
+	int cl_pid = ca->cl_pid;
+	int rv, result, pid_dead;
+
+	cl = &client[cl_ci];
+
+	log_debug("cmd_killpath %d,%d,%d flags %x",
+		  cl_ci, cl_fd, cl_pid, ca->header.cmd_flags);
+
+	rv = recv(cl_fd, cl->killpath, SANLK_HELPER_PATH_LEN, MSG_WAITALL);
+	if (rv != SANLK_HELPER_PATH_LEN) {
+		log_error("cmd_killpath %d,%d,%d recv path %d %d",
+			  cl_ci, cl_fd, cl_pid, rv, errno);
+		memset(cl->killpath, 0, SANLK_HELPER_PATH_LEN);
+		memset(cl->killargs, 0, SANLK_HELPER_ARGS_LEN);
+		result = -ENOTCONN;
+		goto done;
+	}
+
+	rv = recv(cl_fd, cl->killargs, SANLK_HELPER_ARGS_LEN, MSG_WAITALL);
+	if (rv != SANLK_HELPER_ARGS_LEN) {
+		log_error("cmd_killpath %d,%d,%d recv args %d %d",
+			  cl_ci, cl_fd, cl_pid, rv, errno);
+		memset(cl->killpath, 0, SANLK_HELPER_PATH_LEN);
+		memset(cl->killargs, 0, SANLK_HELPER_ARGS_LEN);
+		result = -ENOTCONN;
+		goto done;
+	}
+
+	cl->killpath[SANLK_HELPER_PATH_LEN - 1] = '\0';
+	cl->killargs[SANLK_HELPER_ARGS_LEN - 1] = '\0';
+
+	if (ca->header.cmd_flags & SANLK_KILLPATH_PID)
+		cl->flags |= CL_KILLPATH_PID;
+
+	result = 0;
+ done:
+	pthread_mutex_lock(&cl->mutex);
+	pid_dead = cl->pid_dead;
+	cl->cmd_active = 0;
+	pthread_mutex_unlock(&cl->mutex);
+
+	if (pid_dead) {
+		/* release tokens in case a client sets/changes its killpath
+		   after it has acquired leases */
+		release_cl_tokens(task, cl);
+		client_free(cl_ci);
+		return;
+	}
+
+	send_result(cl_fd, &ca->header, result);
 	client_resume(ca->ci_in);
 }
 
@@ -1224,6 +1339,9 @@ void call_cmd_thread(struct task *task, struct cmd_args *ca)
 	case SM_CMD_EXAMINE_RESOURCE:
 		cmd_examine(task, ca);
 		break;
+	case SM_CMD_KILLPATH:
+		cmd_killpath(task, ca);
+		break;
 	};
 }
 
@@ -1254,17 +1372,19 @@ static int print_state_daemon(char *str)
 	snprintf(str, SANLK_STATE_MAXSTR-1,
 		 "our_host_name=%s "
 		 "use_aio=%d "
-		 "io_timeout=%d "
-		 "id_renewal=%d "
-		 "id_renewal_fail=%d "
-		 "id_renewal_warn=%d "
+		 "kill_grace_seconds=%d "
+		 "helper_pid=%d "
+		 "helper_kill_fd=%d "
+		 "helper_full_count=%u "
+		 "helper_last_status=%llu "
 		 "monotime=%llu",
 		 our_host_name_global,
 		 main_task.use_aio,
-		 main_task.io_timeout_seconds,
-		 main_task.id_renewal_seconds,
-		 main_task.id_renewal_fail_seconds,
-		 main_task.id_renewal_warn_seconds,
+		 kill_grace_seconds,
+		 helper_pid,
+		 helper_kill_fd,
+		 helper_full_count,
+		 (unsigned long long)helper_last_status,
 		 (unsigned long long)monotime());
 
 	return strlen(str) + 1;
@@ -1278,7 +1398,8 @@ static int print_state_client(struct client *cl, int ci, char *str)
 		 "ci=%d "
 		 "fd=%d "
 		 "pid=%d "
-		 "restrict=%x "
+		 "flags=%x "
+		 "restricted=%x "
 		 "cmd_active=%d "
 		 "cmd_last=%d "
 		 "pid_dead=%d "
@@ -1289,7 +1410,8 @@ static int print_state_client(struct client *cl, int ci, char *str)
 		 ci,
 		 cl->fd,
 		 cl->pid,
-		 cl->restrict,
+		 cl->flags,
+		 cl->restricted,
 		 cl->cmd_active,
 		 cl->cmd_last,
 		 cl->pid_dead,
@@ -1308,7 +1430,9 @@ static int print_state_lockspace(struct space *sp, char *str, const char *list_n
 	snprintf(str, SANLK_STATE_MAXSTR-1,
 		 "list=%s "
 		 "space_id=%u "
+		 "io_timeout=%d "
 		 "host_generation=%llu "
+		 "renew_fail=%d "
 		 "space_dead=%d "
 		 "killing_pids=%d "
 		 "corrupt_result=%d "
@@ -1320,7 +1444,9 @@ static int print_state_lockspace(struct space *sp, char *str, const char *list_n
 		 "renewal_last_success=%llu",
 		 list_name,
 		 sp->space_id,
+		 sp->io_timeout,
 		 (unsigned long long)sp->host_generation,
+		 sp->renew_fail,
 		 sp->space_dead,
 		 sp->killing_pids,
 		 sp->lease_status.corrupt_result,
@@ -1362,13 +1488,15 @@ static int print_state_host(struct host_status *hs, char *str)
 		 "last_req=%llu "
 		 "owner_id=%llu "
 		 "owner_generation=%llu "
-		 "timestamp=%llu",
+		 "timestamp=%llu "
+		 "io_timeout=%u",
 		 (unsigned long long)hs->last_check,
 		 (unsigned long long)hs->last_live,
 		 (unsigned long long)hs->last_req,
 		 (unsigned long long)hs->owner_id,
 		 (unsigned long long)hs->owner_generation,
-		 (unsigned long long)hs->timestamp);
+		 (unsigned long long)hs->timestamp,
+		 hs->io_timeout);
 
 	return strlen(str) + 1;
 }
@@ -1529,7 +1657,7 @@ static void cmd_status(int fd, struct sm_header *h_recv, int client_maxi)
 	pthread_mutex_lock(&spaces_mutex);
 	list_for_each_entry(sp, &spaces, list)
 		send_state_lockspace(fd, sp, "spaces");
-	list_for_each_entry(sp, &spaces_rem, list)
+	list_for_each_entry(sp, &spaces_add, list)
 		send_state_lockspace(fd, sp, "spaces_rem");
 	list_for_each_entry(sp, &spaces_rem, list)
 		send_state_lockspace(fd, sp, "spaces_add");
@@ -1621,7 +1749,7 @@ static void cmd_restrict(int ci, int fd, struct sm_header *h_recv)
 	log_debug("cmd_restrict ci %d fd %d pid %d flags %x",
 		  ci, fd, client[ci].pid, h_recv->cmd_flags);
 
-	client[ci].restrict = h_recv->cmd_flags;
+	client[ci].restricted = h_recv->cmd_flags;
 
 	send_result(fd, h_recv, 0);
 }

@@ -25,15 +25,27 @@
 #define SANLK_RESTRICT_SIGKILL	0x00000002
 #define SANLK_RESTRICT_SIGTERM	0x00000004
 
+/* killpath flags */
+#define SANLK_KILLPATH_PID	0x00000001
+
 /* release flags */
 #define SANLK_REL_ALL		0x00000001
 
-/* request flags */
+/*
+ * request force_mode
+ * SANLK_REQ_KILL_PID: send SIGKILL to pid holding the resource, or
+ *                     SIGTERM if SIGKILL is restricted
+ * SANLK_REQ_SIGUSR1:  send SIGUSR1 to pid holding the resource
+ */
+
 #define SANLK_REQ_KILL_PID	0x00000001
+#define SANLK_REQ_SIGUSR1	0x00000002
 
 int sanlock_register(void);
 
 int sanlock_restrict(int sock, uint32_t flags);
+
+int sanlock_killpath(int sock, uint32_t flags, char *path, char *args);
 
 int sanlock_acquire(int sock, int pid, uint32_t flags, int res_count,
 		    struct sanlk_resource *res_args[],
