@@ -5,7 +5,7 @@
 %endif
 
 Name:           sanlock
-Version:        3.4.0
+Version:        3.5.0
 Release:        1%{?dist}
 Summary:        A shared storage lock manager
 
@@ -14,7 +14,7 @@ License:        GPLv2 and GPLv2+ and LGPLv2+
 URL:            https://fedorahosted.org/sanlock/
 BuildRoot:      %{_tmppath}/%{name}-%{version}-%{release}-root-%(%{__id_u} -n)
 BuildRequires:  libblkid-devel libaio-devel python python-devel
-ExclusiveArch:  x86_64 aarch64 %{power64}
+ExclusiveArch:  x86_64 aarch64 s390x %{power64}
 %if %{with_systemd}
 BuildRequires:  systemd-units
 %endif
@@ -27,7 +27,7 @@ Requires(post): systemd-sysv
 Requires(preun): systemd-units
 Requires(postun): systemd-units
 %endif
-Source0:        http://git.fedorahosted.org/cgit/sanlock.git/snapshot/%{name}-%{version}.tar.gz
+Source0:        https://releases.pagure.org/sanlock/%{name}-%{version}.tar.gz
 
 # Patch0: 0001-foo.patch
 
@@ -279,6 +279,9 @@ common sanlock lockspace.
 
 
 %changelog
+* Wed Apr 26 2017 David Teigland <teigland@redhat.com> - 3.5.0-1
+- Update to sanlock-3.5.0
+
 * Fri Jun 10 2016 David Teigland <teigland@redhat.com> - 3.4.0-1
 - Update to sanlock-3.4.0
 

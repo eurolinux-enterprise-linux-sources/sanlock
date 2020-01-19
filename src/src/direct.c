@@ -73,13 +73,10 @@
  *                    delta_lease_renew()
  */
 
-static int do_paxos_action(int action, struct task *task, int io_timeout,
-			   struct sanlk_resource *res,
-			   int max_hosts, int num_hosts,
-			   uint64_t local_host_id,
-			   uint64_t local_host_generation,
-			   struct leader_record *leader_in,
-			   struct leader_record *leader_ret)
+static int do_paxos_action(int action, struct task *task, int io_timeout, struct sanlk_resource *res,
+			   int max_hosts, int num_hosts, int write_clear,
+			   uint64_t local_host_id, uint64_t local_host_generation,
+			   struct leader_record *leader_in, struct leader_record *leader_ret)
 {
 	struct token *token;
 	struct leader_record leader;
@@ -119,7 +116,7 @@ static int do_paxos_action(int action, struct task *task, int io_timeout,
 
 	switch (action) {
 	case ACT_DIRECT_INIT:
-		rv = paxos_lease_init(task, token, num_hosts, max_hosts);
+		rv = paxos_lease_init(task, token, num_hosts, max_hosts, write_clear);
 		break;
 
 	case ACT_ACQUIRE:
@@ -170,10 +167,9 @@ int direct_acquire(struct task *task, int io_timeout,
 		   struct leader_record *leader_ret)
 {
 	return do_paxos_action(ACT_ACQUIRE, task, io_timeout, res,
-			       -1, num_hosts,
+			       -1, num_hosts, 0,
 			       local_host_id, local_host_generation,
-			       NULL,
-			       leader_ret);
+			       NULL, leader_ret);
 }
 
 int direct_release(struct task *task, int io_timeout,
@@ -181,10 +177,9 @@ int direct_release(struct task *task, int io_timeout,
 		   struct leader_record *leader_ret)
 {
 	return do_paxos_action(ACT_RELEASE, task, io_timeout, res,
-			       -1, -1,
+			       -1, -1, 0,
 			       0, 0,
-			       NULL,
-			       leader_ret);
+			       NULL, leader_ret);
 }
 
 static int do_delta_action(int action,
@@ -340,7 +335,7 @@ int direct_write_lockspace(struct task *task, struct sanlk_lockspace *ls,
 }
 
 int direct_write_resource(struct task *task, struct sanlk_resource *res,
-			  int max_hosts, int num_hosts)
+			  int max_hosts, int num_hosts, int write_clear)
 {
 	if (!res)
 		return -1;
@@ -352,7 +347,9 @@ int direct_write_resource(struct task *task, struct sanlk_resource *res,
 		return -ENODEV;
 
 	return do_paxos_action(ACT_DIRECT_INIT, task, 0, res,
-			       max_hosts, num_hosts, 0, 0, NULL, NULL);
+			       max_hosts, num_hosts, write_clear,
+			       0, 0,
+			       NULL, NULL);
 }
 
 int direct_read_leader(struct task *task,
@@ -368,7 +365,9 @@ int direct_read_leader(struct task *task,
 
 	else if (res)
 		rv = do_paxos_action(ACT_READ_LEADER, task, io_timeout, res,
-				     -1, -1, 0, 0, NULL, leader_ret);
+				     -1, -1, 0,
+				     0, 0,
+				     NULL, leader_ret);
 	return rv;
 }
 
@@ -385,7 +384,9 @@ int direct_write_leader(struct task *task,
 
 	} else if (res) {
 		rv = do_paxos_action(ACT_WRITE_LEADER, task, io_timeout, res,
-				     -1, -1, 0, 0, leader, NULL);
+				     -1, -1, 0,
+				     0, 0,
+				     leader, NULL);
 	}
 
 	return rv;
@@ -407,16 +408,23 @@ int direct_dump(struct task *task, char *dump_path, int force_mode)
 	char sname[NAME_ID_SIZE+1];
 	char rname[NAME_ID_SIZE+1];
 	uint64_t sector_nr;
+	uint64_t dump_size = 0;
+	uint64_t end_sector_nr;
 	int sector_count, datalen, align_size;
 	int i, rv, b;
 
 	memset(&sd, 0, sizeof(struct sync_disk));
 
+	/* /path[:<offset>[:<size>]] */
 	colon = strstr(dump_path, ":");
 	if (colon) {
 		off_str = colon + 1;
 		*colon = '\0';
 		sd.offset = atoll(off_str);
+
+		colon = strstr(off_str, ":");
+		if (colon)
+			dump_size = atoll(colon + 1);
 	}
 
 	strncpy(sd.path, dump_path, SANLK_PATH_LEN);
@@ -455,8 +463,9 @@ int direct_dump(struct task *task, char *dump_path, int force_mode)
 	printf("\n");
 
 	sector_nr = 0;
+	end_sector_nr = dump_size / sd.sector_size;
 
-	while (1) {
+	while (end_sector_nr == 0 || sector_nr < end_sector_nr) {
 		memset(sname, 0, sizeof(rname));
 		memset(rname, 0, sizeof(rname));
 		memset(data, 0, sd.sector_size);
@@ -551,7 +560,8 @@ int direct_dump(struct task *task, char *dump_path, int force_mode)
 				printf("%04u %04llu SH\n", i+1, (unsigned long long)mb.generation);
 			}
 		} else {
-			break;
+			if (end_sector_nr == 0)
+				break;
 		}
 
 		sector_nr += sector_count;

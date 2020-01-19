@@ -73,6 +73,7 @@ struct thread_pool {
 
 /* priorities are LOG_* from syslog.h */
 int log_logfile_priority = LOG_WARNING;
+int log_logfile_use_utc = 0;
 int log_syslog_priority = LOG_ERR;
 int log_stderr_priority = -1; /* -D sets this to LOG_DEBUG */
 
@@ -1834,7 +1835,7 @@ static void print_usage(void)
 	printf("sanlock client set_config -s LOCKSPACE [-u 0|1] [-O 0|1]\n");
 	printf("sanlock client log_dump\n");
 	printf("sanlock client shutdown [-f 0|1] [-w 0|1]\n");
-	printf("sanlock client init -s LOCKSPACE | -r RESOURCE\n");
+	printf("sanlock client init -s LOCKSPACE | -r RESOURCE [-z 0|1]\n");
 	printf("sanlock client read -s LOCKSPACE | -r RESOURCE\n");
 	printf("sanlock client align -s LOCKSPACE\n");
 	printf("sanlock client add_lockspace -s LOCKSPACE\n");
@@ -1851,7 +1852,7 @@ static void print_usage(void)
 	printf("sanlock direct <action> [-a 0|1] [-o 0|1]\n");
 	printf("sanlock direct init -s LOCKSPACE | -r RESOURCE\n");
 	printf("sanlock direct read_leader -s LOCKSPACE | -r RESOURCE\n");
-	printf("sanlock direct dump <path>[:<offset>]\n");
+	printf("sanlock direct dump <path>[:<offset>[:<size>]]\n");
 	printf("\n");
 	printf("LOCKSPACE = <lockspace_name>:<host_id>:<path>:<offset>\n");
 	printf("  <lockspace_name>	name of lockspace\n");
@@ -2160,6 +2161,9 @@ static int read_command_line(int argc, char *argv[])
 			com.used_set = 1;
 			com.used = atoi(optionarg);
 			break;
+		case 'z':
+			com.clear_arg = 1;
+			break;
 
 		case 'c':
 			begin_command = 1;
@@ -2296,6 +2300,10 @@ static void read_config_file(void)
 		} else if (!strcmp(str, "logfile_priority")) {
 			get_val_int(line, &val);
 			log_logfile_priority = val;
+
+		} else if (!strcmp(str, "logfile_use_utc")) {
+			get_val_int(line, &val);
+			log_logfile_use_utc = val;
 
 		} else if (!strcmp(str, "syslog_priority")) {
 			get_val_int(line, &val);
@@ -2756,7 +2764,8 @@ static int do_client(void)
 		else
 			rv = sanlock_write_resource(com.res_args[0],
 						    com.max_hosts,
-						    com.num_hosts, 0);
+						    com.num_hosts,
+						    com.clear_arg ? SANLK_WRITE_CLEAR : 0);
 		log_tool("init done %d", rv);
 		break;
 
@@ -3042,7 +3051,7 @@ static int do_direct_init(void)
 		}
 
 		rv = direct_write_resource(&main_task, com.res_args[0],
-					   com.max_hosts, com.num_hosts);
+					   com.max_hosts, com.num_hosts, com.clear_arg);
 	}
 
 	log_tool("init done %d", rv);
