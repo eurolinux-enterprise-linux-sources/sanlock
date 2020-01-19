@@ -1857,13 +1857,13 @@ static void print_usage(void)
 	printf("LOCKSPACE = <lockspace_name>:<host_id>:<path>:<offset>\n");
 	printf("  <lockspace_name>	name of lockspace\n");
 	printf("  <host_id>		local host identifier in lockspace\n");
-	printf("  <path>		disk to storage reserved for leases\n");
+	printf("  <path>		path to storage reserved for leases\n");
 	printf("  <offset>		offset on path (bytes)\n");
 	printf("\n");
 	printf("RESOURCE = <lockspace_name>:<resource_name>:<path>:<offset>[:<lver>]\n");
 	printf("  <lockspace_name>	name of lockspace\n");
 	printf("  <resource_name>	name of resource\n");
-	printf("  <path>		disk to storage reserved for leases\n");
+	printf("  <path>		path to storage reserved for leases\n");
 	printf("  <offset>		offset on path (bytes)\n");
 	printf("  <lver>                optional leader version or SH for shared lease\n");
 	printf("\n");
@@ -2351,6 +2351,10 @@ static void read_config_file(void)
 		} else if (!strcmp(str, "renewal_history_size")) {
 			get_val_int(line, &val);
 			com.renewal_history_size = val;
+
+		} else if (!strcmp(str, "paxos_debug_all")) {
+			get_val_int(line, &val);
+			com.paxos_debug_all = val;
 		}
 	}
 
@@ -2664,7 +2668,7 @@ static int do_client(void)
 	case ACT_ACQUIRE:
 		log_tool("acquire pid %d", com.pid);
 		flags |= com.orphan ? SANLK_ACQUIRE_ORPHAN : 0;
-		rv = sanlock_acquire(-1, com.pid, 0, com.res_count, com.res_args, NULL);
+		rv = sanlock_acquire(-1, com.pid, flags, com.res_count, com.res_args, NULL);
 		log_tool("acquire done %d", rv);
 		break;
 
@@ -3215,6 +3219,7 @@ int main(int argc, char *argv[])
 	com.renewal_read_extend_sec_set = 0;
 	com.renewal_read_extend_sec = 0;
 	com.renewal_history_size = DEFAULT_RENEWAL_HISTORY_SIZE;
+	com.paxos_debug_all = 0;
 
 	if (getgrnam("sanlock") && getpwnam("sanlock")) {
 		com.uname = (char *)"sanlock";

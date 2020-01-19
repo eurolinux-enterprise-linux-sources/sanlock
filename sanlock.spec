@@ -5,13 +5,13 @@
 %endif
 
 Name:           sanlock
-Version:        3.5.0
+Version:        3.6.0
 Release:        1%{?dist}
 Summary:        A shared storage lock manager
 
 Group:          System Environment/Base
 License:        GPLv2 and GPLv2+ and LGPLv2+
-URL:            https://fedorahosted.org/sanlock/
+URL:            https://pagure.io/sanlock
 BuildRoot:      %{_tmppath}/%{name}-%{version}-%{release}-root-%(%{__id_u} -n)
 BuildRequires:  libblkid-devel libaio-devel python python-devel
 ExclusiveArch:  x86_64 aarch64 s390x %{power64}
@@ -279,6 +279,9 @@ common sanlock lockspace.
 
 
 %changelog
+* Tue Dec 05 2017 David Teigland <teigland@redhat.com> - 3.6.0-1
+- Update to sanlock-3.6.0
+
 * Wed Apr 26 2017 David Teigland <teigland@redhat.com> - 3.5.0-1
 - Update to sanlock-3.5.0
 
