@@ -201,6 +201,7 @@ static int do_delta_action(int action,
 	struct space space;
 	char bitmap[HOSTID_BITMAP_SIZE];
 	int read_result, rv;
+	int rd_ms, wr_ms;
 
 	memset(bitmap, 0, sizeof(bitmap));
 
@@ -251,8 +252,10 @@ static int do_delta_action(int action,
 				       NULL,
 				       -1,
 				       &read_result,
+				       0,
 				       &leader,
-				       &leader);
+				       &leader,
+				       &rd_ms, &wr_ms);
 		break;
 	case ACT_RELEASE_ID:
 		rv = delta_lease_leader_read(task, io_timeout, &sd,

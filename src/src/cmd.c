@@ -126,6 +126,7 @@ static const char *acquire_error_str(int error)
 	case SANLK_ACQUIRE_IDLIVE:
 	case SANLK_ACQUIRE_OWNED:
 	case SANLK_ACQUIRE_OTHER:
+	case SANLK_ACQUIRE_OWNED_RETRY:
 		return "lease owned by other host";
 
 	case SANLK_ACQUIRE_SHRETRY:
@@ -181,8 +182,8 @@ static void cmd_acquire(struct task *task, struct cmd_args *ca)
 
 	new_tokens_count = ca->header.data;
 
-	log_debug("cmd_acquire %d,%d,%d ci_in %d fd %d count %d",
-		  cl_ci, cl_fd, cl_pid, ca->ci_in, fd, new_tokens_count);
+	log_debug("cmd_acquire %d,%d,%d ci_in %d fd %d count %d flags %x",
+		  cl_ci, cl_fd, cl_pid, ca->ci_in, fd, new_tokens_count, ca->header.cmd_flags);
 
 	if (new_tokens_count > SANLK_MAX_RESOURCES) {
 		log_error("cmd_acquire %d,%d,%d new %d max %d",
@@ -396,6 +397,7 @@ static void cmd_acquire(struct task *task, struct cmd_args *ca)
 			case SANLK_ACQUIRE_IDLIVE:
 			case SANLK_ACQUIRE_OWNED:
 			case SANLK_ACQUIRE_OTHER:
+			case SANLK_ACQUIRE_OWNED_RETRY:
 				lvl = com.quiet_fail ? LOG_DEBUG : LOG_ERR;
 				break;
 			default:
@@ -1114,6 +1116,15 @@ static void cmd_set_lvb(struct task *task GNUC_UNUSED, struct cmd_args *ca)
 
 	lvblen = ca->header.length - sizeof(struct sm_header) - sizeof(struct sanlk_resource);
 
+	/* 4096 is the max sector size we handle, it is compared
+	   against the actual 512/4K sector size in res_set_lvb. */
+
+	if (lvblen > 4096) {
+		log_error("cmd_set_lvb %d,%d lvblen %d too big", ca->ci_in, fd, lvblen);
+		result = -E2BIG;
+		goto reply;
+	}
+
 	lvb = malloc(lvblen);
 	if (!lvb) {
 		result = -ENOMEM;
@@ -1122,11 +1133,16 @@ static void cmd_set_lvb(struct task *task GNUC_UNUSED, struct cmd_args *ca)
 
 	rv = recv(fd, lvb, lvblen, MSG_WAITALL);
 	if (rv != lvblen) {
+		log_error("cmd_set_lvb %d,%d recv lvblen %d lvb %d %d",
+			  ca->ci_in, fd, lvblen, rv, errno);
 		result = -ENOTCONN;
 		goto reply;
 	}
 
 	result = res_set_lvb(&res, lvb, lvblen);
+
+	log_debug("cmd_set_lvb ci %d fd %d result %d res %s:%s",
+		  ca->ci_in, fd, result, res.lockspace_name, res.name);
  reply:
 	if (lvb)
 		free(lvb);
@@ -1155,6 +1171,9 @@ static void cmd_get_lvb(struct task *task GNUC_UNUSED, struct cmd_args *ca)
 	lvblen = ca->header.data2;
 
 	result = res_get_lvb(&res, &lvb, &lvblen);
+
+	log_debug("cmd_get_lvb ci %d fd %d result %d res %s:%s",
+		  ca->ci_in, fd, result, res.lockspace_name, res.name);
  reply:
 	memcpy(&h, &ca->header, sizeof(struct sm_header));
 	h.version = SM_PROTO;
@@ -2060,6 +2079,7 @@ static int print_state_daemon(char *str)
 		 "mlock_level=%d "
 		 "quiet_fail=%d "
 		 "debug_renew=%d "
+		 "renewal_history_size=%d "
 		 "gid=%d "
 		 "uid=%d "
 		 "sh_retries=%d "
@@ -2080,6 +2100,7 @@ static int print_state_daemon(char *str)
 		 com.mlock_level,
 		 com.quiet_fail,
 		 com.debug_renew,
+		 com.renewal_history_size,
 		 com.gid,
 		 com.uid,
 		 com.sh_retries,
@@ -2148,6 +2169,7 @@ static int print_state_lockspace(struct space *sp, char *str, const char *list_n
 		 "used_retries=%u "
 		 "external_used=%d "
 		 "used_by_orphans=%d "
+		 "renewal_read_extend_sec=%u "
 		 "corrupt_result=%d "
 		 "acquire_last_result=%d "
 		 "renewal_last_result=%d "
@@ -2165,6 +2187,7 @@ static int print_state_lockspace(struct space *sp, char *str, const char *list_n
 		 sp->used_retries,
 		 (sp->flags & SP_EXTERNAL_USED) ? 1 : 0,
 		 (sp->flags & SP_USED_BY_ORPHANS) ? 1 : 0,
+		 sp->renewal_read_extend_sec,
 		 sp->lease_status.corrupt_result,
 		 sp->lease_status.acquire_last_result,
 		 sp->lease_status.renewal_last_result,
@@ -2215,6 +2238,25 @@ static int print_state_host(struct host_status *hs, char *str)
 		 (unsigned long long)hs->timestamp,
 		 hs->io_timeout,
 		 hs->owner_name);
+
+	return strlen(str) + 1;
+}
+
+static int print_state_renewal(struct renewal_history *hi, char *str)
+{
+	memset(str, 0, SANLK_STATE_MAXSTR);
+
+	snprintf(str, SANLK_STATE_MAXSTR-1,
+		 "timestamp=%llu "
+		 "read_ms=%d "
+		 "write_ms=%d "
+		 "next_timeouts=%d "
+		 "next_errors=%d",
+		 (unsigned long long)hi->timestamp,
+		 hi->read_ms,
+		 hi->write_ms,
+		 hi->next_timeouts,
+		 hi->next_errors);
 
 	return strlen(str) + 1;
 }
@@ -2343,6 +2385,26 @@ static void send_state_host(int fd, struct host_status *hs, int host_id)
 		send(fd, str, str_len, MSG_NOSIGNAL);
 }
 
+static void send_state_renewal(int fd, struct renewal_history *hi)
+{
+	struct sanlk_state st;
+	char str[SANLK_STATE_MAXSTR];
+	int str_len;
+
+	memset(&st, 0, sizeof(st));
+
+	st.type = SANLK_STATE_RENEWAL;
+	st.data64 = hi->timestamp;
+
+	str_len = print_state_renewal(hi, str);
+
+	st.str_len = str_len;
+
+	send(fd, &st, sizeof(st), MSG_NOSIGNAL);
+	if (str_len)
+		send(fd, str, str_len, MSG_NOSIGNAL);
+}
+
 static void cmd_status(int fd, struct sm_header *h_recv, int client_maxi)
 {
 	struct sm_header h;
@@ -2452,6 +2514,97 @@ static void cmd_host_status(int fd, struct sm_header *h_recv)
 
 	if (status)
 		free(status);
+}
+
+static void cmd_renewal(int fd, struct sm_header *h_recv)
+{
+	struct sm_header h;
+	struct sanlk_lockspace lockspace;
+	struct space *sp;
+	uint32_t io_timeout = 0;
+	struct renewal_history *history = NULL;
+	struct renewal_history *hi;
+	int history_size, history_prev, history_next;
+	int i, rv, len;
+
+	memset(&h, 0, sizeof(h));
+	memcpy(&h, h_recv, sizeof(struct sm_header));
+	h.version = SM_PROTO;
+	h.length = sizeof(h);
+	h.data = 0;
+
+	if (!com.renewal_history_size)
+		goto fail;
+
+	len = sizeof(struct renewal_history) * com.renewal_history_size;
+
+	history = malloc(len);
+	if (!history) {
+		h.data = -ENOMEM;
+		goto fail;
+	}
+
+	rv = recv(fd, &lockspace, sizeof(struct sanlk_lockspace), MSG_WAITALL);
+	if (rv != sizeof(struct sanlk_lockspace)) {
+		h.data = -ENOTCONN;
+		goto fail;
+	}
+
+	pthread_mutex_lock(&spaces_mutex);
+	sp = find_lockspace(lockspace.name);
+	if (sp) {
+		history_size = sp->renewal_history_size;
+		history_prev = sp->renewal_history_prev;
+		history_next = sp->renewal_history_next;
+		io_timeout = sp->io_timeout;
+
+		if (history_size != com.renewal_history_size) {
+			log_error("mismatch history size");
+			history_size = 0;
+			history_prev = 0;
+			history_next = 0;
+		} else {
+			memcpy(history, sp->renewal_history, len);
+		}
+	}
+	pthread_mutex_unlock(&spaces_mutex);
+
+	if (!sp) {
+		h.data = -ENOSPC;
+		goto fail;
+	}
+
+	if (!history_size || (!history_prev && !history_next))
+		goto fail;
+
+	h.data2 = io_timeout;
+
+	send(fd, &h, sizeof(h), MSG_NOSIGNAL);
+
+	/* If next slot is non-zero, then we've wrapped and
+	   should begin sending history from next to end
+	   before sending from 0 to prev. */
+
+	if (history[history_next].timestamp) {
+		for (i = history_next; i < history_size; i++) {
+			hi = &history[i];
+			send_state_renewal(fd, hi);
+		}
+	
+	}
+	for (i = 0; i < history_next; i++) {
+		hi = &history[i];
+		send_state_renewal(fd, hi);
+	}
+
+	if (history)
+		free(history);
+	return;
+ fail:
+	send(fd, &h, sizeof(h), MSG_NOSIGNAL);
+
+	if (history)
+		free(history);
 }
 
 static char send_data_buf[LOG_DUMP_SIZE];
@@ -2693,6 +2846,10 @@ void call_cmd_daemon(int ci, struct sm_header *h_recv, int client_maxi)
 	case SM_CMD_HOST_STATUS:
 		strcpy(client[ci].owner_name, "host_status");
 		cmd_host_status(fd, h_recv);
+		break;
+	case SM_CMD_RENEWAL:
+		strcpy(client[ci].owner_name, "renewal");
+		cmd_renewal(fd, h_recv);
 		break;
 	case SM_CMD_LOG_DUMP:
 		strcpy(client[ci].owner_name, "log_dump");

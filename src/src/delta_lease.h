@@ -33,8 +33,10 @@ int delta_lease_renew(struct task *task,
 		      struct delta_extra *extra,
                       int prev_result,
 		      int *read_result,
+		      int log_renewal_level,
                       struct leader_record *leader_last,
-                      struct leader_record *leader_ret);
+                      struct leader_record *leader_ret,
+		      int *rd_ms, int *wr_ms);
 
 int delta_lease_release(struct task *task,
                         struct space *sp,

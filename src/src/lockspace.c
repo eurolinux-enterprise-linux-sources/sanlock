@@ -532,6 +532,44 @@ static void close_event_fds(struct space *sp)
 }
 
 /*
+ * if delta_result is success:
+ * new record saving last_success (timestamp in renewal), rd_ms, wr_ms
+ * if delta_result is timeout:
+ * increment next_timeouts in prev record
+ * if delta_result is failure:
+ * increment next_errors in prev record
+ */
+
+static void save_renewal_history(struct space *sp, int delta_result,
+				 uint64_t last_success, int rd_ms, int wr_ms)
+{
+	struct renewal_history *hi;
+
+	if (!sp->renewal_history_size || !sp->renewal_history)
+		return;
+
+	if (delta_result == SANLK_OK) {
+		hi = &sp->renewal_history[sp->renewal_history_next];
+
+		hi->timestamp = last_success;
+		hi->read_ms = rd_ms;
+		hi->write_ms = wr_ms;
+
+		sp->renewal_history_prev = sp->renewal_history_next;
+		sp->renewal_history_next++;
+		if (sp->renewal_history_next >= sp->renewal_history_size)
+			sp->renewal_history_next = 0;
+	} else {
+		hi = &sp->renewal_history[sp->renewal_history_prev];
+
+		if (delta_result == SANLK_AIO_TIMEOUT)
+			hi->next_timeouts++;
+		else
+			hi->next_errors++;
+	}
+}
+
+/*
  * This thread must not be stopped unless all pids that may be using any
  * resources in it are dead/gone.  (The USED flag in the lockspace represents
  * pids using resources in the lockspace, when those pids are not using actual
@@ -547,12 +585,17 @@ static void *lockspace_thread(void *arg_in)
 	struct space *sp;
 	struct leader_record leader;
 	uint64_t delta_begin, last_success = 0;
+	int log_renewal_level = -1;
 	int rv, delta_length, renewal_interval = 0;
 	int id_renewal_seconds, id_renewal_fail_seconds;
 	int acquire_result, delta_result, read_result;
+	int rd_ms, wr_ms;
 	int opened = 0;
 	int stop = 0;
 	int wd_con;
+
+	if (com.debug_renew)
+		log_renewal_level = LOG_DEBUG;
 
 	sp = (struct space *)arg_in;
 
@@ -638,6 +681,8 @@ static void *lockspace_thread(void *arg_in)
 	sp->lease_status.renewal_last_attempt = delta_begin;
 	if (delta_result == SANLK_OK)
 		sp->lease_status.renewal_last_success = last_success;
+	/* First renewal entry shows the acquire time with 0 latencies. */
+	save_renewal_history(sp, delta_result, last_success, 0, 0);
 	pthread_mutex_unlock(&sp->mutex);
 
 	if (acquire_result < 0)
@@ -651,7 +696,6 @@ static void *lockspace_thread(void *arg_in)
 		pthread_mutex_unlock(&sp->mutex);
 		if (stop)
 			break;
-
 
 		/*
 		 * wait between each renewal
@@ -681,7 +725,9 @@ static void *lockspace_thread(void *arg_in)
 		delta_result = delta_lease_renew(&task, sp, &sp->host_id_disk,
 						 sp->space_name, bitmap, &extra,
 						 delta_result, &read_result,
-						 &leader, &leader);
+						 log_renewal_level,
+						 &leader, &leader,
+						 &rd_ms, &wr_ms);
 		delta_length = monotime() - delta_begin;
 
 		if (delta_result == SANLK_OK) {
@@ -710,7 +756,6 @@ static void *lockspace_thread(void *arg_in)
 			sp->lease_status.renewal_read_count++;
 		}
 
-
 		/*
 		 * pet the watchdog
 		 * (don't update on thread_stop because it's probably unlinked)
@@ -719,6 +764,7 @@ static void *lockspace_thread(void *arg_in)
 		if (delta_result == SANLK_OK && !sp->thread_stop)
 			update_watchdog(sp, last_success, id_renewal_fail_seconds);
 
+		save_renewal_history(sp, delta_result, last_success, rd_ms, wr_ms);
 		pthread_mutex_unlock(&sp->mutex);
 
 
@@ -732,9 +778,11 @@ static void *lockspace_thread(void *arg_in)
 		} else if (delta_length > id_renewal_seconds) {
 			log_erros(sp, "renewed %llu delta_length %d too long",
 				  (unsigned long long)last_success, delta_length);
-		} else if (com.debug_renew) {
-			log_space(sp, "renewed %llu delta_length %d interval %d",
-				  (unsigned long long)last_success, delta_length, renewal_interval);
+		} else {
+			if (com.debug_renew) {
+				log_space(sp, "renewed %llu delta_length %d interval %d",
+					  (unsigned long long)last_success, delta_length, renewal_interval);
+			}
 		}
 	}
 
@@ -805,8 +853,21 @@ int add_lockspace_start(struct sanlk_lockspace *ls, uint32_t io_timeout, struct 
 	sp->set_bitmap_seconds = calc_set_bitmap_seconds(io_timeout);
 	pthread_mutex_init(&sp->mutex, NULL);
 
+	if (com.renewal_read_extend_sec_set)
+		sp->renewal_read_extend_sec = com.renewal_read_extend_sec;
+	else
+		sp->renewal_read_extend_sec = io_timeout;
+
 	for (i = 0; i < MAX_EVENT_FDS; i++)
 		sp->event_fds[i] = -1;
+
+	if (com.renewal_history_size) {
+		sp->renewal_history = malloc(sizeof(struct renewal_history) * com.renewal_history_size);
+		if (sp->renewal_history) {
+			sp->renewal_history_size = com.renewal_history_size;
+			memset(sp->renewal_history, 0, sizeof(struct renewal_history) * com.renewal_history_size);
+		}
+	}
 
 	pthread_mutex_lock(&spaces_mutex);
 

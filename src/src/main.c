@@ -35,6 +35,7 @@
 #include <sys/utsname.h>
 #include <sys/resource.h>
 #include <uuid/uuid.h>
+#include <sys/eventfd.h>
 
 #define EXTERN
 #include "sanlock_internal.h"
@@ -190,8 +191,10 @@ static int client_alloc(void)
 {
 	int i;
 
+	/* pollfd is one element longer as we use an additional element for the
+	 * eventfd notification mechanism */
 	client = malloc(CLIENT_NALLOC * sizeof(struct client));
-	pollfd = malloc(CLIENT_NALLOC * sizeof(struct pollfd));
+	pollfd = malloc((CLIENT_NALLOC+1) * sizeof(struct pollfd));
 
 	if (!client || !pollfd) {
 		log_error("can't alloc for client or pollfd array");
@@ -360,6 +363,9 @@ void client_resume(int ci)
 		/* make poll() watch this connection */
 		pollfd[ci].fd = cl->fd;
 		pollfd[ci].events = POLLIN;
+
+		/* interrupt any poll() that might already be running */
+		eventfd_write(efd, 1);
 	}
  out:
 	pthread_mutex_unlock(&cl->mutex);
@@ -737,19 +743,29 @@ static int main_loop(void)
 	int i, rv, empty, check_all;
 	char *check_buf = NULL;
 	int check_buf_len = 0;
+	uint64_t ebuf;
 
 	gettimeofday(&last_check, NULL);
 	poll_timeout = STANDARD_CHECK_INTERVAL;
 	check_interval = STANDARD_CHECK_INTERVAL;
 
 	while (1) {
-		rv = poll(pollfd, client_maxi + 1, poll_timeout);
+		/* as well as the clients, check the eventfd */
+		pollfd[client_maxi+1].fd = efd;
+		pollfd[client_maxi+1].events = POLLIN;
+
+		rv = poll(pollfd, client_maxi + 2, poll_timeout);
 		if (rv == -1 && errno == EINTR)
 			continue;
 		if (rv < 0) {
 			/* not sure */
 		}
-		for (i = 0; i <= client_maxi; i++) {
+		for (i = 0; i <= client_maxi + 1; i++) {
+			if (pollfd[i].fd == efd && pollfd[i].revents & POLLIN) {
+				/* a client_resume completed */
+				eventfd_read(efd, &ebuf);
+				continue;
+			}
 			if (client[i].fd < 0)
 				continue;
 			if (pollfd[i].revents & POLLIN) {
@@ -1202,6 +1218,7 @@ static void process_connection(int ci)
 	case SM_CMD_SHUTDOWN:
 	case SM_CMD_STATUS:
 	case SM_CMD_HOST_STATUS:
+	case SM_CMD_RENEWAL:
 	case SM_CMD_LOG_DUMP:
 	case SM_CMD_GET_LOCKSPACES:
 	case SM_CMD_GET_HOSTS:
@@ -1431,65 +1448,23 @@ static void setup_limits(void)
 
 static void setup_groups(void)
 {
-	int rv, i, j, h;
-	int pngroups, sngroups, ngroups_max;
-	gid_t *pgroup, *sgroup;
+	int rv;
 
 	if (!com.uname || !com.gname)
 		return;
 
-	ngroups_max = sysconf(_SC_NGROUPS_MAX);
-	if (ngroups_max < 0) {
-		log_error("cannot get the max number of groups %i", errno);
+	rv = initgroups(com.uname, com.gid);
+	if (rv < 0) {
+		log_error("error initializing groups errno %i", errno);
+	}
+}
+
+static void setup_uid_gid(void)
+{
+	int rv;
+
+	if (!com.uname || !com.gname)
 		return;
-	}
-
-	pgroup = malloc(ngroups_max * 2 * sizeof(gid_t));
-	if (!pgroup) {
-		log_error("cannot malloc the group list %i", errno);
-		exit(EXIT_FAILURE);
-	}
-
-	pngroups = getgroups(ngroups_max, pgroup);
-	if (pngroups < 0) {
-		log_error("cannot get the process groups %i", errno);
-		goto out;
-	}
-
-	sgroup = pgroup + ngroups_max;
-	sngroups = ngroups_max;
-
-	rv = getgrouplist(com.uname, com.gid, sgroup, &sngroups);
-	if (rv < 0) {
-		log_error("cannot get the user %s groups %i", com.uname, errno);
-		goto out;
-	}
-
-	for (i = 0, j = pngroups; i < sngroups; i++) {
-		if (j >= ngroups_max) {
-			log_error("too many groups for the user %s", com.uname);
-			break;
-		}
-
-		/* check if the groups is already present in the list */
-		for (h = 0; h < j; h++) {
-			if (pgroup[h] == sgroup[i]) {
-				goto skip_gid;
-			}
-		}
-
-		pgroup[j] = sgroup[i];
-		j++;
-
- skip_gid:
-		; /* skipping the gid because it's already present */
-	}
-
-	rv = setgroups(j, pgroup);
-	if (rv < 0) {
-		log_error("cannot set the user %s groups %i", com.uname, errno);
-		goto out;
-	}
 
 	rv = setgid(com.gid);
 	if (rv < 0) {
@@ -1509,9 +1484,6 @@ static void setup_groups(void)
 	if (rv < 0) {
 		log_error("cannot set dumpable process errno %i", errno);
 	}
-
- out:
-	free(pgroup);
 }
 
 static void setup_signals(void)
@@ -1660,9 +1632,12 @@ static int do_daemon(void)
 {
 	int fd, rv;
 
-	/* TODO: copy comprehensive daemonization method from libvirtd */
+
+	/* This can take a while so do it before forking. */
+	setup_groups();
 
 	if (!com.debug) {
+		/* TODO: copy comprehensive daemonization method from libvirtd */
 		if (daemon(0, 0) < 0) {
 			log_tool("cannot fork daemon\n");
 			exit(EXIT_FAILURE);
@@ -1699,7 +1674,7 @@ static int do_daemon(void)
 
 	setup_host_name();
 
-	setup_groups();
+	setup_uid_gid();
 
 	log_level(0, 0, NULL, LOG_WARNING, "sanlock daemon started %s host %s",
 		  VERSION, our_host_name_global);
@@ -1717,6 +1692,12 @@ static int do_daemon(void)
 	setup_token_manager();
 	if (rv < 0)
 		goto out_threads;
+
+	/* initialize global eventfd for client_resume notification */
+	if ((efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK)) == -1) {
+		log_error("couldn't create eventfd");
+		goto out_threads;
+	}
 
 	main_loop();
 
@@ -1825,8 +1806,9 @@ static void print_usage(void)
 	printf("\n");
 	printf("sanlock daemon [options]\n");
 	printf("  -D            no fork and print all logging to stderr\n");
-	printf("  -Q 0|1        quiet error messages for common lock contention (0)\n");
+	printf("  -Q 0|1        quiet error messages for common lock contention (%d)\n", DEFAULT_QUIET_FAIL);
 	printf("  -R 0|1        renewal debugging, log debug info about renewals (0)\n");
+	printf("  -H <num>      renewal history size (%d)\n", DEFAULT_RENEWAL_HISTORY_SIZE);
 	printf("  -L <pri>      write logging at priority level and up to logfile (3 LOG_ERR)\n");
 	printf("                (use -1 for none)\n");
 	printf("  -S <pri>      write logging at priority level and up to syslog (3 LOG_ERR)\n");
@@ -1847,6 +1829,7 @@ static void print_usage(void)
 	printf("sanlock client status [-D] [-o p|s]\n");
 	printf("sanlock client gets [-h 0|1]\n");
 	printf("sanlock client host_status -s LOCKSPACE [-D]\n");
+	printf("sanlock client renewal -s LOCKSPACE\n");
 	printf("sanlock client set_event -s LOCKSPACE -i <host_id> [-g gen] -e <event> -d <data>\n");
 	printf("sanlock client set_config -s LOCKSPACE [-u 0|1] [-O 0|1]\n");
 	printf("sanlock client log_dump\n");
@@ -1955,6 +1938,8 @@ static int read_command_line(int argc, char *argv[])
 			com.action = ACT_STATUS;
 		else if (!strcmp(act, "host_status"))
 			com.action = ACT_HOST_STATUS;
+		else if (!strcmp(act, "renewal"))
+			com.action = ACT_RENEWAL;
 		else if (!strcmp(act, "gets"))
 			com.action = ACT_GETS;
 		else if (!strcmp(act, "log_dump"))
@@ -2070,6 +2055,9 @@ static int read_command_line(int argc, char *argv[])
 			break;
 		case 'R':
 			com.debug_renew = atoi(optionarg);
+			break;
+		case 'H':
+			com.renewal_history_size = atoi(optionarg);
 			break;
 		case 'L':
 			log_logfile_priority = atoi(optionarg);
@@ -2345,6 +2333,16 @@ static void read_config_file(void)
 			memset(str, 0, sizeof(str));
 			get_val_str(line, str);
 			strncpy(com.our_host_name, str, NAME_ID_SIZE);
+
+		} else if (!strcmp(str, "renewal_read_extend_sec")) {
+			/* zero is a valid setting so we need the _set field to say it's set */
+			get_val_int(line, &val);
+			com.renewal_read_extend_sec_set = 1;
+			com.renewal_read_extend_sec = val;
+
+		} else if (!strcmp(str, "renewal_history_size")) {
+			get_val_int(line, &val);
+			com.renewal_history_size = val;
 		}
 	}
 
@@ -2583,6 +2581,10 @@ static int do_client(void)
 
 	case ACT_HOST_STATUS:
 		rv = sanlock_host_status(com.debug, com.lockspace.name);
+		break;
+
+	case ACT_RENEWAL:
+		rv = sanlock_renewal(com.lockspace.name);
 		break;
 
 	case ACT_GETS:
@@ -3200,6 +3202,10 @@ int main(int argc, char *argv[])
 	com.aio_arg = DEFAULT_USE_AIO;
 	com.pid = -1;
 	com.sh_retries = DEFAULT_SH_RETRIES;
+	com.quiet_fail = DEFAULT_QUIET_FAIL;
+	com.renewal_read_extend_sec_set = 0;
+	com.renewal_read_extend_sec = 0;
+	com.renewal_history_size = DEFAULT_RENEWAL_HISTORY_SIZE;
 
 	if (getgrnam("sanlock") && getpwnam("sanlock")) {
 		com.uname = (char *)"sanlock";

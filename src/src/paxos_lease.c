@@ -181,7 +181,7 @@ static int write_dblock_mblock_sh(struct task *task,
 	memcpy(iobuf, (char *)&pd_end, sizeof(struct paxos_dblock));
 	memcpy(iobuf + MBLOCK_OFFSET, (char *)&mb_end, sizeof(struct mode_block));
 
-	rv = write_iobuf(disk->fd, offset, iobuf, iobuf_len, task, token->io_timeout);
+	rv = write_iobuf(disk->fd, offset, iobuf, iobuf_len, task, token->io_timeout, NULL);
 
 	if (rv < 0) {
 		log_errot(token, "write_dblock_mblock_sh host_id %llu gen %llu rv %d",
@@ -513,7 +513,7 @@ static int run_ballot(struct task *task, struct token *token, int num_hosts,
 			continue;
 		memset(iobuf[d], 0, iobuf_len);
 
-		rv = read_iobuf(disk->fd, disk->offset, iobuf[d], iobuf_len, task, token->io_timeout);
+		rv = read_iobuf(disk->fd, disk->offset, iobuf[d], iobuf_len, task, token->io_timeout, NULL);
 		if (rv == SANLK_AIO_TIMEOUT)
 			iobuf[d] = NULL;
 		if (rv < 0)
@@ -667,7 +667,7 @@ static int run_ballot(struct task *task, struct token *token, int num_hosts,
 			continue;
 		memset(iobuf[d], 0, iobuf_len);
 
-		rv = read_iobuf(disk->fd, disk->offset, iobuf[d], iobuf_len, task, token->io_timeout);
+		rv = read_iobuf(disk->fd, disk->offset, iobuf[d], iobuf_len, task, token->io_timeout, NULL);
 		if (rv == SANLK_AIO_TIMEOUT)
 			iobuf[d] = NULL;
 		if (rv < 0)
@@ -954,7 +954,7 @@ int paxos_read_buf(struct task *task,
 
 	memset(iobuf, 0, iobuf_len);
 
-	rv = read_iobuf(disk->fd, disk->offset, iobuf, iobuf_len, task, token->io_timeout);
+	rv = read_iobuf(disk->fd, disk->offset, iobuf, iobuf_len, task, token->io_timeout, NULL);
 
 	*buf_out = iobuf;
 
@@ -1141,7 +1141,7 @@ static int _lease_read_one(struct task *task,
 
 	memset(iobuf, 0, iobuf_len);
 
-	rv = read_iobuf(disk->fd, disk->offset, iobuf, iobuf_len, task, token->io_timeout);
+	rv = read_iobuf(disk->fd, disk->offset, iobuf, iobuf_len, task, token->io_timeout, NULL);
 	if (rv < 0)
 		goto out;
 
@@ -1661,6 +1661,15 @@ int paxos_lease_acquire(struct task *task,
 			goto run;
 		}
 
+		if (flags & PAXOS_ACQUIRE_OWNER_NOWAIT) {
+			log_token(token, "paxos_acquire owner %llu %llu %llu no wait",
+				  (unsigned long long)cur_leader.owner_id,
+				  (unsigned long long)cur_leader.owner_generation,
+				  (unsigned long long)cur_leader.timestamp);
+			error = SANLK_ACQUIRE_OWNED_RETRY;
+			goto out;
+		}
+
  skip_live_check:
 		/* TODO: test with sleep(2) here */
 		sleep(1);
@@ -1925,24 +1934,6 @@ int paxos_lease_release(struct task *task,
 	struct leader_record *last;
 	int error;
 
-	/*
-	 * If we are releasing this lease very quickly after acquiring it,
-	 * there's a chance that another host was running the same acquire
-	 * ballot that we were and also committed us as the owner of this
-	 * lease, writing our inp values to the leader after we did ourself.
-	 * That leader write from the other host may happen after the leader
-	 * write we will do here releasing ownership.  So the release we do
-	 * here may be clobbered and lost.  The result is that we own the lease
-	 * on disk, but don't know it, so it won't be released unless we happen
-	 * to acquire and release it again.  The solution is that we clear our
-	 * dblock in addition to clearing the leader record.  Other hosts can
-	 * then check our dblock to see if we really do own the lease.  If the
-	 * leader says we own the lease, but our dblock is cleared, then our
-	 * leader write in release was clobbered, and other hosts will run a
-	 * ballot to set a new owner.
-	 */
-	paxos_erase_dblock(task, token, token->host_id);
-
 	error = paxos_lease_leader_read(task, token, &leader, "paxos_release");
 	if (error < 0) {
 		log_errot(token, "paxos_release leader_read error %d", error);
@@ -2110,7 +2101,7 @@ int paxos_lease_init(struct task *task,
 
 	for (d = 0; d < token->r.num_disks; d++) {
 		rv = write_iobuf(token->disks[d].fd, token->disks[d].offset,
-				 iobuf, iobuf_len, task, token->io_timeout);
+				 iobuf, iobuf_len, task, token->io_timeout, NULL);
 
 		if (rv == SANLK_AIO_TIMEOUT)
 			aio_timeout = 1;

@@ -4,15 +4,9 @@
 %define with_systemd 1
 %endif
 
-%if 0%{?fedora} >= 18 || 0%{?rhel} >= 7
-%define with_systemd_macros 1
-%else
-%define with_systemd_macros 0
-%endif
-
 Name:           sanlock
-Version:        3.2.4
-Release:        2%{?dist}
+Version:        3.4.0
+Release:        1%{?dist}
 Summary:        A shared storage lock manager
 
 Group:          System Environment/Base
@@ -35,14 +29,14 @@ Requires(postun): systemd-units
 %endif
 Source0:        http://git.fedorahosted.org/cgit/sanlock.git/snapshot/%{name}-%{version}.tar.gz
 
-Patch0: 0001-wdmd-prevent-probe-while-watchdog-is-used.patch
+# Patch0: 0001-foo.patch
 
 %description
 The sanlock daemon manages leases for applications on hosts using shared storage.
 
 %prep
 %setup -q
-%patch0 -p1 -b .0001-wdmd-prevent-probe-while-watchdog-is-used.patch
+# %patch0 -p1 -b .0001-foo.patch
 
 %build
 # upstream does not require configure
@@ -73,10 +67,9 @@ make -C reset \
 
 
 %if %{with_systemd}
-install -D -m 0755 init.d/sanlock $RPM_BUILD_ROOT/usr/lib/systemd/systemd-sanlock
-install -D -m 0644 init.d/sanlock.service $RPM_BUILD_ROOT/%{_unitdir}/sanlock.service
+install -D -m 0644 init.d/sanlock.service.native $RPM_BUILD_ROOT/%{_unitdir}/sanlock.service
 install -D -m 0755 init.d/wdmd $RPM_BUILD_ROOT/usr/lib/systemd/systemd-wdmd
-install -D -m 0644 init.d/wdmd.service $RPM_BUILD_ROOT/%{_unitdir}/wdmd.service
+install -D -m 0644 init.d/wdmd.service.native $RPM_BUILD_ROOT/%{_unitdir}/wdmd.service
 install -D -m 0755 init.d/fence_sanlockd $RPM_BUILD_ROOT/usr/lib/systemd/systemd-fence_sanlockd
 install -D -m 0644 init.d/fence_sanlockd.service $RPM_BUILD_ROOT/%{_unitdir}/fence_sanlockd.service
 install -D -m 0644 init.d/sanlk-resetd.service $RPM_BUILD_ROOT/%{_unitdir}/sanlk-resetd.service
@@ -91,9 +84,6 @@ install -D -m 0644 src/logrotate.sanlock \
 
 install -D -m 0644 src/sanlock.conf \
 	$RPM_BUILD_ROOT/etc/sanlock/sanlock.conf
-
-install -D -m 0644 init.d/sanlock.sysconfig \
-	$RPM_BUILD_ROOT/etc/sysconfig/sanlock
 
 install -D -m 0644 init.d/wdmd.sysconfig \
 	$RPM_BUILD_ROOT/etc/sysconfig/wdmd
@@ -117,65 +107,22 @@ getent passwd sanlock > /dev/null || /usr/sbin/useradd \
 
 %post
 %if %{with_systemd}
-%if %{with_systemd_macros}
 %systemd_post wdmd.service sanlock.service
-%else
-if [ $1 -eq 1 ] ; then
-  /bin/systemctl daemon-reload >/dev/null 2>&1 || :
-fi
-%endif
-%else
-if [ $1 -eq 1 ] ; then
-  /sbin/chkconfig --add sanlock
-  /sbin/chkconfig --add wdmd
-fi
 %endif
 
 %preun
 %if %{with_systemd}
-%if %{with_systemd_macros}
-%systemd_preun sanlock.service
-%systemd_preun wdmd.service
-%else
-if [ $1 = 0 ]; then
-  /bin/systemctl --no-reload disable sanlock.service > /dev/null 2>&1 || :
-  /bin/systemctl stop sanlock.service > /dev/null 2>&1 || :
-  /bin/systemctl --no-reload disable wdmd.service > /dev/null 2>&1 || :
-  /bin/systemctl stop wdmd.service > /dev/null 2>&1 || :
-fi
-%endif
-%else
-if [ $1 = 0 ]; then
-  /sbin/service sanlock stop > /dev/null 2>&1
-  /sbin/chkconfig --del sanlock
-  /sbin/service wdmd stop > /dev/null 2>&1
-  /sbin/chkconfig --del wdmd
-fi
+%systemd_preun wdmd.service sanlock.service
 %endif
 
 %postun
 %if %{with_systemd}
-%if %{with_systemd_macros}
-%systemd_postun_with_restart sanlock.service
-%systemd_postun_with_restart wdmd.service
-%else
-/bin/systemctl daemon-reload >/dev/null 2>&1 || :
-if [ $1 -ge 1 ] ; then
-  /bin/systemctl try-restart sanlock.service >/dev/null 2>&1 || :
-  /bin/systemctl try-restart wdmd.service >/dev/null 2>&1 || :
-fi
-%endif
-%else
-if [ $1 -ge 1 ] ; then
-  /sbin/service sanlock condrestart >/dev/null 2>&1 || :
-  /sbin/service wdmd condrestart >/dev/null 2>&1 || :
-fi
+%systemd_postun
 %endif
 
 %files
 %defattr(-,root,root,-)
 %if %{with_systemd}
-/usr/lib/systemd/systemd-sanlock
 /usr/lib/systemd/systemd-wdmd
 %{_unitdir}/sanlock.service
 %{_unitdir}/wdmd.service
@@ -192,10 +139,10 @@ fi
 %{_mandir}/man8/sanlock*
 %config(noreplace) %{_sysconfdir}/logrotate.d/sanlock
 %config(noreplace) %{_sysconfdir}/sanlock/sanlock.conf
-%config(noreplace) %{_sysconfdir}/sysconfig/sanlock
 %config(noreplace) %{_sysconfdir}/sysconfig/wdmd
-%doc init.d/sanlock.service.native
-%doc init.d/wdmd.service.native
+%doc init.d/sanlock
+%doc init.d/sanlock.service
+%doc init.d/wdmd.service
 
 %package        lib
 Summary:        A shared storage lock manager library
@@ -286,7 +233,6 @@ if [ $1 -eq 1 ] ; then
 %else
   /sbin/chkconfig --add fence_sanlockd
 %endif
-ccs_update_schema > /dev/null 2>&1 ||:
 fi
 
 %preun -n       fence-sanlock
@@ -333,6 +279,12 @@ common sanlock lockspace.
 
 
 %changelog
+* Fri Jun 10 2016 David Teigland <teigland@redhat.com> - 3.4.0-1
+- Update to sanlock-3.4.0
+
+* Mon Feb 22 2016 David Teigland <teigland@redhat.com> - 3.3.0-1
+- Update to sanlock-3.3.0
+
 * Tue Dec 01 2015 David Teigland <teigland@redhat.com> - 3.2.4-2
 - wdmd: prevent probe while watchdog is used
 
