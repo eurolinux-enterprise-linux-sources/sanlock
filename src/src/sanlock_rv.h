@@ -38,6 +38,9 @@
 #define SANLK_LEADER_NUMHOSTS	-228
 #define SANLK_LEADER_CHECKSUM	-229
 
+#define SANLK_ADDLS_SIZES	-230
+#define SANLK_ADDLS_INVALID_HOSTID -231
+
 /* paxos_lease_acquire, paxos_lease_release */
 
 #define SANLK_ACQUIRE_LVER	-240
@@ -64,5 +67,12 @@
 #define SANLK_REQUEST_VERSION	-271
 #define SANLK_REQUEST_OLD	-272
 #define SANLK_REQUEST_LVER	-273
+
+/* rindex ops */
+#define SANLK_RINDEX_MAGIC	-274
+#define SANLK_RINDEX_VERSION	-275
+#define SANLK_RINDEX_LOCKSPACE	-276
+#define SANLK_RINDEX_OFFSET	-277
+#define SANLK_RINDEX_DIFF	-278
 
 #endif

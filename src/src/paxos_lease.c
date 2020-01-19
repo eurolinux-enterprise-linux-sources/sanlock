@@ -81,7 +81,7 @@ int paxos_lease_request_read(struct task *task, struct token *token,
 
 	/* 1 = request record is second sector */
 
-	rv = read_sectors(&token->disks[0], 1, 1, (char *)&rr_end,
+	rv = read_sectors(&token->disks[0], token->sector_size, 1, 1, (char *)&rr_end,
 			  sizeof(struct request_record),
 			  task, token->io_timeout, "request");
 	if (rv < 0)
@@ -100,7 +100,7 @@ int paxos_lease_request_write(struct task *task, struct token *token,
 
 	request_record_out(rr, &rr_end);
 
-	rv = write_sector(&token->disks[0], 1, (char *)&rr_end,
+	rv = write_sector(&token->disks[0], token->sector_size, 1, (char *)&rr_end,
 			  sizeof(struct request_record),
 			  task, token->io_timeout, "request");
 	if (rv < 0)
@@ -165,13 +165,15 @@ static int write_dblock_mblock_sh(struct task *task,
 	char *iobuf, **p_iobuf;
 	uint64_t offset;
 	uint32_t checksum;
-	int iobuf_len, rv;
+	int iobuf_len, rv, sector_size;
 
 	memset(&mb, 0, sizeof(mb));
 	mb.flags = MBLOCK_SHARED;
 	mb.generation = token->host_generation;
 
-	iobuf_len = disk->sector_size;
+	sector_size = token->sector_size;
+
+	iobuf_len = sector_size;
 	if (!iobuf_len)
 		return -EINVAL;
 
@@ -181,7 +183,7 @@ static int write_dblock_mblock_sh(struct task *task,
 	if (rv)
 		return -ENOMEM;
 
-	offset = disk->offset + ((2 + host_id - 1) * disk->sector_size);
+	offset = disk->offset + ((2 + host_id - 1) * sector_size);
 
 	paxos_dblock_out(pd, &pd_end);
 
@@ -238,7 +240,7 @@ static int write_dblock(struct task *task,
 	pd->checksum = checksum;
 	pd_end.checksum = cpu_to_le32(checksum);
 
-	rv = write_sector(disk, 2 + host_id - 1, (char *)&pd_end, sizeof(struct paxos_dblock),
+	rv = write_sector(disk, token->sector_size, 2 + host_id - 1, (char *)&pd_end, sizeof(struct paxos_dblock),
 			  task, token->io_timeout, "dblock");
 	return rv;
 }
@@ -261,7 +263,7 @@ static int write_leader(struct task *task,
 	lr->checksum = checksum;
 	lr_end.checksum = cpu_to_le32(checksum);
 
-	rv = write_sector(disk, 0, (char *)&lr_end, sizeof(struct leader_record),
+	rv = write_sector(disk, token->sector_size, 0, (char *)&lr_end, sizeof(struct leader_record),
 			  task, token->io_timeout, "leader");
 	return rv;
 }
@@ -290,7 +292,7 @@ int paxos_lease_leader_clobber(struct task *task,
 	leader->checksum = checksum;
 	lr_end.checksum = cpu_to_le32(checksum);
 
-	rv = write_sector(&token->disks[0], 0, (char *)&lr_end, sizeof(struct leader_record),
+	rv = write_sector(&token->disks[0], token->sector_size, 0, (char *)&lr_end, sizeof(struct leader_record),
 			  task, token->io_timeout, caller);
 	return rv;
 }
@@ -306,7 +308,7 @@ static int read_dblock(struct task *task,
 
 	/* 1 leader block + 1 request block; host_id N is block offset N-1 */
 
-	rv = read_sectors(disk, 2 + host_id - 1, 1, (char *)&pd_end, sizeof(struct paxos_dblock),
+	rv = read_sectors(disk, token->sector_size, 2 + host_id - 1, 1, (char *)&pd_end, sizeof(struct paxos_dblock),
 			  task, token->io_timeout, "dblock");
 
 	paxos_dblock_in(&pd_end, pd);
@@ -324,7 +326,7 @@ static int read_dblocks(struct task *task,
 	char *data;
 	int data_len, rv, i;
 
-	data_len = pds_count * disk->sector_size;
+	data_len = pds_count * sector_size;
 
 	data = malloc(data_len);
 	if (!data) {
@@ -335,7 +337,7 @@ static int read_dblocks(struct task *task,
 
 	/* 2 = 1 leader block + 1 request block */
 
-	rv = read_sectors(disk, 2, pds_count, data, data_len,
+	rv = read_sectors(disk, token->sector_size, 2, pds_count, data, data_len,
 			  task, "dblocks");
 	if (rv < 0)
 		goto out_free;
@@ -344,7 +346,7 @@ static int read_dblocks(struct task *task,
 	   paxos_dblock */
 
 	for (i = 0; i < pds_count; i++) {
-		memcpy(&pd_end, data + (i * disk->sector_size),
+		memcpy(&pd_end, data + (i * sector_size),
 		       sizeof(struct paxos_dblock));
 
 		paxos_dblock_in(&pd_end, &pd);
@@ -369,9 +371,14 @@ static int read_leader(struct task *task,
 	struct leader_record lr_end;
 	int rv;
 
+	if (!token->sector_size) {
+		log_errot(token, "paxos read_leader with zero sector_size");
+		return -EINVAL;
+	}
+
 	/* 0 = leader record is first sector */
 
-	rv = read_sectors(disk, 0, 1, (char *)&lr_end, sizeof(struct leader_record),
+	rv = read_sectors(disk, token->sector_size, 0, 1, (char *)&lr_end, sizeof(struct leader_record),
 			  task, token->io_timeout, "leader");
 
 	/* N.B. checksum is computed while the data is in ondisk format. */
@@ -461,7 +468,7 @@ static int run_ballot(struct task *task, struct token *token, uint32_t flags,
 	uint32_t checksum;
 	int num_disks = token->r.num_disks;
 	int num_writes, num_reads;
-	int sector_size = token->disks[0].sector_size;
+	int sector_size = token->sector_size;
 	int sector_count;
 	int iobuf_len;
 	int phase2 = 0;
@@ -584,8 +591,7 @@ static int run_ballot(struct task *task, struct token *token, uint32_t flags,
 				continue;
 
 			if (bk->lver > dblock.lver) {
-				log_level(0, token->token_id, NULL, LOG_WARNING,
-					  "ballot %llu abort1 larger lver in bk[%d] %llu:%llu:%llu:%llu:%llu:%llu "
+				log_warnt(token, "ballot %llu abort1 larger lver in bk[%d] %llu:%llu:%llu:%llu:%llu:%llu "
 					  "our dblock %llu:%llu:%llu:%llu:%llu:%llu",
 					  (unsigned long long)next_lver, q,
 					  (unsigned long long)bk->mbal,
@@ -611,8 +617,7 @@ static int run_ballot(struct task *task, struct token *token, uint32_t flags,
 			/* see "It aborts the ballot" in comment above */
 
 			if (bk->mbal > dblock.mbal) {
-				log_level(0, token->token_id, NULL, LOG_WARNING,
-					  "ballot %llu abort1 larger mbal in bk[%d] %llu:%llu:%llu:%llu:%llu:%llu "
+				log_warnt(token, "ballot %llu abort1 larger mbal in bk[%d] %llu:%llu:%llu:%llu:%llu:%llu "
 					  "our dblock %llu:%llu:%llu:%llu:%llu:%llu",
 					  (unsigned long long)next_lver, q,
 					  (unsigned long long)bk->mbal,
@@ -805,8 +810,7 @@ static int run_ballot(struct task *task, struct token *token, uint32_t flags,
 				 * also be caught the the bk->mbal > dblock.mbal condition
 				 * below.
 				 */
-				log_level(0, token->token_id, NULL, LOG_WARNING,
-					  "ballot %llu abort2 larger lver in bk[%d] %llu:%llu:%llu:%llu:%llu:%llu "
+				log_warnt(token, "ballot %llu abort2 larger lver in bk[%d] %llu:%llu:%llu:%llu:%llu:%llu "
 					  "our dblock %llu:%llu:%llu:%llu:%llu:%llu",
 					  (unsigned long long)next_lver, q,
 					  (unsigned long long)bk->mbal,
@@ -832,8 +836,7 @@ static int run_ballot(struct task *task, struct token *token, uint32_t flags,
 			/* see "It aborts the ballot" in comment above */
 
 			if (bk->mbal > dblock.mbal) {
-				log_level(0, token->token_id, NULL, LOG_WARNING,
-					  "ballot %llu abort2 larger mbal in bk[%d] %llu:%llu:%llu:%llu:%llu:%llu "
+				log_warnt(token, "ballot %llu abort2 larger mbal in bk[%d] %llu:%llu:%llu:%llu:%llu:%llu "
 					  "our dblock %llu:%llu:%llu:%llu:%llu:%llu",
 					  (unsigned long long)next_lver, q,
 					  (unsigned long long)bk->mbal,
@@ -938,11 +941,12 @@ static void log_leader_error(int result,
 		  (unsigned long long)lr->write_timestamp);
 }
 
-static int verify_leader(struct token *token,
+static int _verify_leader(struct token *token,
 			 struct sync_disk *disk,
 			 struct leader_record *lr,
 			 uint32_t checksum,
-			 const char *caller)
+			 const char *caller,
+			 int print_error)
 {
 	struct leader_record leader_end;
 	struct leader_record leader_rr;
@@ -952,51 +956,31 @@ static int verify_leader(struct token *token,
 		return SANLK_LEADER_MAGIC;
 
 	if (lr->magic != PAXOS_DISK_MAGIC) {
-		log_errot(token, "verify_leader wrong magic %x %s",
-			  lr->magic, disk->path);
 		result = SANLK_LEADER_MAGIC;
 		goto fail;
 	}
 
 	if ((lr->version & 0xFFFF0000) != PAXOS_DISK_VERSION_MAJOR) {
-		log_errot(token, "verify_leader wrong version %x %s",
-			  lr->version, disk->path);
 		result = SANLK_LEADER_VERSION;
 		goto fail;
 	}
 
-	if (lr->sector_size != disk->sector_size) {
-		log_errot(token, "verify_leader wrong sector size %d %d %s",
-			  lr->sector_size, disk->sector_size, disk->path);
-		result = SANLK_LEADER_SECTORSIZE;
-		goto fail;
-	}
-
 	if (strncmp(lr->space_name, token->r.lockspace_name, NAME_ID_SIZE)) {
-		log_errot(token, "verify_leader wrong space name %.48s %.48s %s",
-			  lr->space_name, token->r.lockspace_name, disk->path);
 		result = SANLK_LEADER_LOCKSPACE;
 		goto fail;
 	}
 
 	if (strncmp(lr->resource_name, token->r.name, NAME_ID_SIZE)) {
-		log_errot(token, "verify_leader wrong resource name %.48s %.48s %s",
-			  lr->resource_name, token->r.name, disk->path);
 		result = SANLK_LEADER_RESOURCE;
 		goto fail;
 	}
 
 	if (lr->num_hosts < token->host_id) {
-		log_errot(token, "verify_leader num_hosts too small %llu %llu %s",
-			  (unsigned long long)lr->num_hosts,
-			  (unsigned long long)token->host_id, disk->path);
 		result = SANLK_LEADER_NUMHOSTS;
 		goto fail;
 	}
 
 	if (lr->checksum != checksum) {
-		log_errot(token, "verify_leader wrong checksum %x %x %s",
-			  lr->checksum, checksum, disk->path);
 		result = SANLK_LEADER_CHECKSUM;
 		goto fail;
 	}
@@ -1004,11 +988,42 @@ static int verify_leader(struct token *token,
 	return SANLK_OK;
 
  fail:
+	if (!print_error)
+		return result;
+
+	switch (result) {
+	case SANLK_LEADER_MAGIC:
+		log_errot(token, "verify_leader wrong magic %x %s",
+			  lr->magic, disk->path);
+		break;
+	case SANLK_LEADER_VERSION:
+		log_errot(token, "verify_leader wrong version %x %s",
+			  lr->version, disk->path);
+		break;
+	case SANLK_LEADER_LOCKSPACE:
+		log_errot(token, "verify_leader wrong space name %.48s %.48s %s",
+			  lr->space_name, token->r.lockspace_name, disk->path);
+		break;
+	case SANLK_LEADER_RESOURCE:
+		log_errot(token, "verify_leader wrong resource name %.48s %.48s %s",
+			  lr->resource_name, token->r.name, disk->path);
+		break;
+	case SANLK_LEADER_NUMHOSTS:
+		log_errot(token, "verify_leader num_hosts too small %llu %llu %s",
+			  (unsigned long long)lr->num_hosts,
+			  (unsigned long long)token->host_id, disk->path);
+		break;
+	case SANLK_LEADER_CHECKSUM:
+		log_errot(token, "verify_leader wrong checksum %x %x %s",
+			  lr->checksum, checksum, disk->path);
+		break;
+	};
+
 	log_leader_error(result, token, disk, lr, caller);
 
 	memset(&leader_end, 0, sizeof(struct leader_record));
 
-	rv = read_sectors(disk, 0, 1, (char *)&leader_end,
+	rv = read_sectors(disk, token->sector_size, 0, 1, (char *)&leader_end,
 			  sizeof(struct leader_record),
 			  NULL, 1, "paxos_verify");
 
@@ -1017,6 +1032,24 @@ static int verify_leader(struct token *token,
 	log_leader_error(rv, token, disk, &leader_rr, "paxos_verify");
 
 	return result;
+}
+
+static int verify_leader(struct token *token,
+			 struct sync_disk *disk,
+			 struct leader_record *lr,
+			 uint32_t checksum,
+			 const char *caller)
+{
+	return _verify_leader(token, disk, lr, checksum, caller, 1);
+}
+
+static int verify_leader_no_error(struct token *token,
+			 struct sync_disk *disk,
+			 struct leader_record *lr,
+			 uint32_t checksum,
+			 const char *caller)
+{
+	return _verify_leader(token, disk, lr, checksum, caller, 0);
 }
 
 int paxos_verify_leader(struct token *token,
@@ -1043,9 +1076,23 @@ int paxos_read_resource(struct task *task,
 {
 	struct leader_record leader;
 	uint32_t checksum;
+	int align_size;
+	int tmp_sector_size = 0;
 	int rv;
 
 	memset(&leader, 0, sizeof(struct leader_record));
+
+	/*
+	 * We don't know the sector size, so we don't know if we should read
+	 * 512 or 4k, but it doesn't matter since the leader record is all that
+	 * we need.  It's probably better to read 4k on a 512 disk than to read 512
+	 * on a 4k disk, so always do a 4k read.
+	 */
+	if (!token->sector_size) {
+		token->sector_size = 4096;
+		token->align_size = sector_size_to_align_size_old(4096);
+		tmp_sector_size = 1;
+	}
 
 	rv = read_leader(task, token, &token->disks[0], &leader, &checksum);
 	if (rv < 0)
@@ -1057,12 +1104,40 @@ int paxos_read_resource(struct task *task,
 	if (!res->name[0])
 		memcpy(token->r.name, leader.resource_name, NAME_ID_SIZE);
 
-	rv = verify_leader(token, &token->disks[0], &leader, checksum, "read_resource");
+	if (token->flags & T_CHECK_EXISTS) {
+		if (leader.magic != PAXOS_DISK_MAGIC)
+			rv = SANLK_LEADER_MAGIC;
+		else
+			rv = SANLK_OK;
+	} else {
+		rv = verify_leader_no_error(token, &token->disks[0], &leader, checksum, "read_resource");
+	}
 
 	if (rv == SANLK_OK) {
 		memcpy(res->lockspace_name, leader.space_name, NAME_ID_SIZE);
 		memcpy(res->name, leader.resource_name, NAME_ID_SIZE);
 		res->lver = leader.lver;
+
+		if ((leader.sector_size == 512) || (leader.sector_size == 4096)) {
+			align_size = leader_align_size_from_flag(leader.flags);
+			if (!align_size)
+				align_size = sector_size_to_align_size_old(leader.sector_size);
+
+			token->sector_size = leader.sector_size;
+			token->align_size = align_size;
+
+			/* The flags set by the user may be wrong. */
+			sanlk_res_sector_flags_clear(&res->flags);
+			sanlk_res_align_flags_clear(&res->flags);
+
+			res->flags |= sanlk_res_sector_size_to_flag(leader.sector_size);
+			res->flags |= sanlk_res_align_size_to_flag(align_size);
+		} else if (tmp_sector_size) {
+			/* we don't know the correct value, so don't set any */
+			/* FIXME: add a note about when this can happen */
+			token->sector_size = 0;
+			token->align_size = 0;
+		}
 	}
 
 	return rv;
@@ -1076,7 +1151,13 @@ int paxos_read_buf(struct task *task,
 	struct sync_disk *disk = &token->disks[0];
 	int rv, iobuf_len;
 
-	iobuf_len = direct_align(disk);
+	if (!token->sector_size || !token->align_size) {
+		log_errot(token, "paxos_read_buf with sector_size %d align_size %d",
+			  token->sector_size, token->align_size);
+		return -EINVAL;
+	}
+
+	iobuf_len = token->align_size;
 	if (iobuf_len < 0)
 		return iobuf_len;
 
@@ -1262,13 +1343,13 @@ static int _lease_read_one(struct task *task,
 	struct paxos_dblock bk;
 	char *iobuf, **p_iobuf;
 	uint32_t host_id = token->host_id;
-	uint32_t sector_size = disk->sector_size;
+	uint32_t sector_size = token->sector_size;
 	uint32_t checksum;
 	struct paxos_dblock *bk_end;
 	uint64_t tmp_mbal = 0;
 	int q, tmp_q = -1, rv, iobuf_len;
 
-	iobuf_len = direct_align(disk);
+	iobuf_len = token->align_size;
 	if (iobuf_len < 0)
 		return iobuf_len;
 
@@ -1588,12 +1669,20 @@ int paxos_lease_acquire(struct task *task,
 	int copy_cur_leader;
 	int disk_open = 0;
 	int error, rv, us;
+	int align_size;
+	int ls_sector_size;
 	int other_io_timeout, other_host_dead_seconds;
 
 	memset(&dblock, 0, sizeof(dblock)); /* shut up compiler */
 
-	log_token(token, "paxos_acquire begin %x %llu %d",
-		  flags, (unsigned long long)acquire_lver, new_num_hosts);
+	log_token(token, "paxos_acquire begin offset %llu 0x%x %d %d",
+		  (unsigned long long)token->disks[0].offset, flags,
+		  token->sector_size, token->align_size);
+
+	if (!token->sector_size) {
+		log_errot(token, "paxos_acquire with zero sector_size");
+		return -EINVAL;
+	}
 
  restart:
 	memset(&tmp_leader, 0, sizeof(tmp_leader));
@@ -1603,6 +1692,26 @@ int paxos_lease_acquire(struct task *task,
 	error = paxos_lease_read(task, token, flags, &cur_leader, &max_mbal, "paxos_acquire", 1);
 	if (error < 0)
 		goto out;
+
+	align_size = leader_align_size_from_flag(cur_leader.flags);
+	if (!align_size)
+		align_size = sector_size_to_align_size_old(cur_leader.sector_size);
+
+	/*
+	 * token sector_size/align_size are initially set from the lockspace values,
+	 * and paxos_lease_read() uses these values.  It's possible but unusual
+	 * that the paxos lease leader record will have different sector/align
+	 * sizes than we used initially.
+	 */
+	if ((cur_leader.sector_size != token->sector_size) ||
+	    (align_size != token->align_size)) {
+		log_token(token, "paxos_acquire restart with different sizes was %d %d now %d %d",
+			  token->sector_size, token->align_size,
+			  cur_leader.sector_size, align_size);
+		token->sector_size = cur_leader.sector_size;
+		token->align_size = align_size;
+		goto restart;
+	}
 
 	if (flags & PAXOS_ACQUIRE_FORCE) {
 		copy_cur_leader = 1;
@@ -1662,7 +1771,7 @@ int paxos_lease_acquire(struct task *task,
 	if (!disk_open) {
 		memset(&host_id_disk, 0, sizeof(host_id_disk));
 
-		rv = lockspace_disk(cur_leader.space_name, &host_id_disk);
+		rv = lockspace_disk(cur_leader.space_name, &host_id_disk, &ls_sector_size);
 		if (rv < 0) {
 			log_errot(token, "paxos_acquire no lockspace info %.48s",
 			  	  cur_leader.space_name);
@@ -1702,20 +1811,20 @@ int paxos_lease_acquire(struct task *task,
 		  (unsigned long long)wait_start);
 
 	while (1) {
-		error = delta_lease_leader_read(task, token->io_timeout, &host_id_disk,
+		error = delta_lease_leader_read(task, ls_sector_size, token->io_timeout,
+						&host_id_disk,
 						cur_leader.space_name,
 						cur_leader.owner_id,
 						&host_id_leader,
 						"paxos_acquire");
 		if (error < 0) {
 			log_errot(token, "paxos_acquire owner %llu %llu %llu "
-				  "delta read %d fd %d path %s off %llu ss %u",
+				  "delta read %d fd %d path %s off %llu",
 				  (unsigned long long)cur_leader.owner_id,
 				  (unsigned long long)cur_leader.owner_generation,
 				  (unsigned long long)cur_leader.timestamp,
 				  error, host_id_disk.fd, host_id_disk.path,
-				  (unsigned long long)host_id_disk.offset,
-				  host_id_disk.sector_size);
+				  (unsigned long long)host_id_disk.offset);
 			goto out;
 		}
 
@@ -1792,8 +1901,7 @@ int paxos_lease_acquire(struct task *task,
 						 cur_leader.owner_id, &owner_dblock);
 				if (!rv && (owner_dblock.flags & DBLOCK_FL_RELEASED)) {
 					/* not an error, but interesting to see */
-					log_level(0, token->token_id, NULL, LOG_WARNING,
-						  "paxos_acquire owner %llu %llu %llu writer %llu owner dblock released",
+					log_warnt(token, "paxos_acquire owner %llu %llu %llu writer %llu owner dblock released",
 						  (unsigned long long)cur_leader.owner_id,
 						  (unsigned long long)cur_leader.owner_generation,
 						  (unsigned long long)cur_leader.timestamp,
@@ -1924,8 +2032,7 @@ int paxos_lease_acquire(struct task *task,
 		    tmp_leader.owner_generation == token->host_generation) {
 			/* not a problem, but interesting to see */
 
-			log_level(0, token->token_id, NULL, LOG_WARNING,
-				  "paxos_acquire %llu owner is our inp "
+			log_warnt(token, "paxos_acquire %llu owner is our inp "
 				  "%llu %llu %llu commited by %llu",
 				  (unsigned long long)next_lver,
 				  (unsigned long long)tmp_leader.owner_id,
@@ -1934,12 +2041,12 @@ int paxos_lease_acquire(struct task *task,
 				  (unsigned long long)tmp_leader.write_id);
 
 			memcpy(leader_ret, &tmp_leader, sizeof(struct leader_record));
+			memcpy(dblock_ret, &dblock, sizeof(struct paxos_dblock));
 			error = SANLK_OK;
 		} else {
 			/* not a problem, but interesting to see */
 
-			log_level(0, token->token_id, NULL, LOG_WARNING,
-				  "paxos_acquire %llu owner is %llu %llu %llu",
+			log_warnt(token, "paxos_acquire %llu owner is %llu %llu %llu",
 				  (unsigned long long)next_lver,
 				  (unsigned long long)tmp_leader.owner_id,
 				  (unsigned long long)tmp_leader.owner_generation,
@@ -2055,8 +2162,7 @@ int paxos_lease_acquire(struct task *task,
 		   owner host_id is alive but with a newer generation, and
 		   we'd be able to get the lease by running the ballot again. */
 
-		log_level(0, token->token_id, NULL, LOG_WARNING,
-			  "ballot %llu commit other owner %llu %llu %llu",
+		log_warnt(token, "ballot %llu commit other owner %llu %llu %llu",
 			  (unsigned long long)new_leader.lver,
 			  (unsigned long long)new_leader.owner_id,
 			  (unsigned long long)new_leader.owner_generation,
@@ -2169,8 +2275,7 @@ int paxos_lease_release(struct task *task,
 	 * new leader.
 	 */
 	if (leader.write_id != token->host_id) {
-		log_level(0, token->token_id, NULL, LOG_WARNING,
-			  "paxos_release skip write "
+		log_warnt(token, "paxos_release skip write "
 			  "last lver %llu owner %llu %llu %llu writer %llu %llu %llu "
 			  "disk lver %llu owner %llu %llu %llu writer %llu %llu %llu",
 			  (unsigned long long)last->lver,
@@ -2304,7 +2409,7 @@ int paxos_lease_release(struct task *task,
 
 int paxos_lease_init(struct task *task,
 		     struct token *token,
-		     int num_hosts, int max_hosts, int write_clear)
+		     int num_hosts, int write_clear)
 {
 	char *iobuf, **p_iobuf;
 	struct leader_record leader;
@@ -2313,33 +2418,28 @@ int paxos_lease_init(struct task *task,
 	struct request_record rr_end;
 	uint32_t checksum;
 	int iobuf_len;
-	int sector_size;
-	int align_size;
+	int sector_size = 0;
+	int align_size = 0;
+	int max_hosts = 0;
 	int aio_timeout = 0;
 	int rv, d;
 
-	if (!num_hosts)
-		num_hosts = DEFAULT_MAX_HOSTS;
-	if (!max_hosts)
+	rv = sizes_from_flags(token->r.flags, &sector_size, &align_size, &max_hosts, "RES");
+	if (rv)
+		return rv;
+
+	if (!sector_size) {
+		/* sector/align flags were not set, use historical defaults */
+		sector_size = token->disks[0].sector_size;
+		align_size = sector_size_to_align_size_old(sector_size);
 		max_hosts = DEFAULT_MAX_HOSTS;
+	}
 
-	if (max_hosts > DEFAULT_MAX_HOSTS)
-		return -E2BIG;
+	if (!num_hosts || (num_hosts > max_hosts))
+		num_hosts = max_hosts;
 
-	if (num_hosts > DEFAULT_MAX_HOSTS)
-		return -EINVAL;
-
-	if (num_hosts > max_hosts)
-		return -EINVAL;
-
-	sector_size = token->disks[0].sector_size;
-
-	align_size = direct_align(&token->disks[0]);
-	if (align_size < 0)
-		return align_size;
-
-	if (sector_size * (2 + max_hosts) > align_size)
-		return -E2BIG;
+	token->sector_size = sector_size;
+	token->align_size = align_size;
 
 	iobuf_len = align_size;
 
@@ -2362,6 +2462,7 @@ int paxos_lease_init(struct task *task,
 
 	leader.timestamp = LEASE_FREE;
 	leader.version = PAXOS_DISK_VERSION_MAJOR | PAXOS_DISK_VERSION_MINOR;
+	leader.flags = leader_align_flag_from_size(align_size);
 	leader.sector_size = sector_size;
 	leader.num_hosts = num_hosts;
 	leader.max_hosts = max_hosts;

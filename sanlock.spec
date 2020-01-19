@@ -5,7 +5,7 @@
 %endif
 
 Name:           sanlock
-Version:        3.6.0
+Version:        3.7.3
 Release:        1%{?dist}
 Summary:        A shared storage lock manager
 
@@ -279,6 +279,21 @@ common sanlock lockspace.
 
 
 %changelog
+* Tue May 21 2019 David Teigland <teigland@redhat.com> - 3.7.3-1
+- Update to sanlock-3.7.3
+
+* Mon May 06 2019 David Teigland <teigland@redhat.com> - 3.7.2-1
+- Update to sanlock-3.7.2 with python size flag cleanups
+
+* Fri Apr 12 2019 David Teigland <teigland@redhat.com> - 3.7.1-2
+- Cleanup up align and sector constants for python
+
+* Fri Apr 05 2019 David Teigland <teigland@redhat.com> - 3.7.1-1
+- Update to sanlock-3.7.1
+
+* Tue Apr 02 2019 David Teigland <teigland@redhat.com> - 3.7.0-1
+- Update to sanlock-3.7.0, plus some patches
+
 * Tue Dec 05 2017 David Teigland <teigland@redhat.com> - 3.6.0-1
 - Update to sanlock-3.6.0
 

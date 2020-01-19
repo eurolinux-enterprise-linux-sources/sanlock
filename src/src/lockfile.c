@@ -25,7 +25,6 @@
 #include <sys/un.h>
 
 #include "sanlock_internal.h"
-#include "sanlock_sock.h"
 #include "log.h"
 #include "lockfile.h"
 
@@ -37,18 +36,21 @@ int lockfile(const char *dir, const char *name, int uid, int gid)
 	mode_t old_umask;
 	int fd, rv;
 
-	old_umask = umask(0022);
-	rv = mkdir(SANLK_RUN_DIR, 0775);
+	/* Make rundir group writable, allowing creation of the lockfile when
+	 * starting as root. */
+
+	old_umask = umask(0002);
+	rv = mkdir(dir, 0775);
 	if (rv < 0 && errno != EEXIST) {
 		umask(old_umask);
 		return rv;
 	}
 	umask(old_umask);
 
-	rv = chown(SANLK_RUN_DIR, uid, gid);
+	rv = chown(dir, uid, gid);
 	if (rv < 0) {
 		log_error("lockfile chown error %s: %s",
-			  SANLK_RUN_DIR, strerror(errno));
+			  dir, strerror(errno));
 		return rv;
 	}
 
@@ -90,25 +92,8 @@ int lockfile(const char *dir, const char *name, int uid, int gid)
 		goto fail;
 	}
 
-	rv = fchown(fd, uid, gid);
-	if (rv < 0) {
-		log_error("lockfile fchown error %s: %s",
-			  path, strerror(errno));
-		goto fail;
-	}
-
 	return fd;
  fail:
 	close(fd);
 	return -1;
 }
-
-void unlink_lockfile(int fd, const char *dir, const char *name)
-{
-	char path[PATH_MAX];
-
-	snprintf(path, PATH_MAX, "%s/%s", dir, name);
-	unlink(path);
-	close(fd);
-}
-

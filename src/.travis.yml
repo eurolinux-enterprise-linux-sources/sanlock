@@ -1,0 +1,16 @@
+dist: xenial
+language: python
+python: 2.7
+
+addons:
+  apt:
+    packages:
+    - gcc
+    - libaio-dev
+    - libblkid-dev
+    - make
+
+script:
+    - make BUILDARGS="--build-lib=."
+    - source tests/env.sh
+    - pytest

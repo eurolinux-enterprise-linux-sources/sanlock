@@ -54,6 +54,7 @@ __set_exception(int en, char *msg)
         en = -en;
         err_name = strerror(en);
     } else {
+        /* Safe to call without releasing the GIL. */
         err_name = sanlock_strerror(en);
     }
 
@@ -132,6 +133,55 @@ __parse_resource(PyObject *obj, struct sanlk_resource **res_ret)
 exit_fail:
     free(res);
     return -1;
+}
+
+enum {SECTOR_SIZE_512 = 512, SECTOR_SIZE_4K = 4096};
+
+static int
+add_sector_flag(int sector, uint32_t *flags)
+{
+    switch (sector) {
+    case SECTOR_SIZE_512:
+        *flags |= SANLK_LSF_SECTOR512;
+	break;
+    case SECTOR_SIZE_4K:
+        *flags |= SANLK_LSF_SECTOR4K;
+	break;
+    default:
+	PyErr_Format(PyExc_ValueError, "Invalid sector value: %d", sector);
+	return -1;
+    }
+    return 0;
+}
+
+enum {
+    ALIGNMENT_1M = 1048576,
+    ALIGNMENT_2M = 2097152,
+    ALIGNMENT_4M = 4194304,
+    ALIGNMENT_8M = 8388608
+};
+
+static int
+add_align_flag(long align, uint32_t *flags)
+{
+    switch (align) {
+    case ALIGNMENT_1M:
+        *flags |= SANLK_RES_ALIGN1M;
+	break;
+    case ALIGNMENT_2M:
+        *flags |= SANLK_RES_ALIGN2M;
+	break;
+    case ALIGNMENT_4M:
+        *flags |= SANLK_RES_ALIGN4M;
+	break;
+    case ALIGNMENT_8M:
+        *flags |= SANLK_RES_ALIGN8M;
+	break;
+    default:
+	PyErr_Format(PyExc_ValueError, "Invalid align value: %ld", align);
+	return -1;
+    }
+    return 0;
 }
 
 static PyObject *
@@ -213,7 +263,11 @@ py_register(PyObject *self __unused, PyObject *args)
 {
     int sanlockfd;
 
+    /* This sholdn't block, but we don't want to take any chance, as blocking
+     * hangs all threads in the caller process. */
+    Py_BEGIN_ALLOW_THREADS
     sanlockfd = sanlock_register();
+    Py_END_ALLOW_THREADS
 
     if (sanlockfd < 0) {
         __set_exception(sanlockfd, "Sanlock registration failed");
@@ -355,33 +409,44 @@ exit_fail:
 
 /* write_lockspace */
 PyDoc_STRVAR(pydoc_write_lockspace, "\
-write_lockspace(lockspace, path, offset=0, max_hosts=0, iotimeout=0)\n\
-Initialize or update a device to be used as sanlock lockspace.");
+write_lockspace(lockspace, path, offset=0, max_hosts=0, iotimeout=0, \
+align=1048576, sector=512)\n\
+Initialize or update a device to be used as sanlock lockspace.\n\
+Align can be one of (1048576, 2097152, 4194304, 8388608).\n\
+Sector can be one of (512, 4096).");
 
 static PyObject *
 py_write_lockspace(PyObject *self __unused, PyObject *args, PyObject *keywds)
 {
-    int rv, max_hosts = 0;
+    int rv, max_hosts = 0, sector = SECTOR_SIZE_512;
+    long align = ALIGNMENT_1M;
     uint32_t io_timeout = 0;
     const char *lockspace, *path;
     struct sanlk_lockspace ls;
 
     static char *kwlist[] = {"lockspace", "path", "offset", "max_hosts",
-                                "iotimeout", NULL};
+                                "iotimeout", "align", "sector", NULL};
 
     /* initialize lockspace structure */
     memset(&ls, 0, sizeof(struct sanlk_lockspace));
 
     /* parse python tuple */
-    if (!PyArg_ParseTupleAndKeywords(args, keywds, "ss|kiI", kwlist,
+    if (!PyArg_ParseTupleAndKeywords(args, keywds, "ss|kiIli", kwlist,
         &lockspace, &path, &ls.host_id_disk.offset, &max_hosts,
-        &io_timeout)) {
+        &io_timeout, &align, &sector)) {
         return NULL;
     }
 
     /* prepare sanlock names */
     strncpy(ls.name, lockspace, SANLK_NAME_LEN);
     strncpy(ls.host_id_disk.path, path, SANLK_PATH_LEN - 1);
+
+    /* set alignment/sector flags */
+    if (add_align_flag(align, &ls.flags) == -1)
+        return NULL;
+
+    if (add_sector_flag(sector, &ls.flags) == -1)
+        return NULL;
 
     /* write sanlock lockspace (gil disabled) */
     Py_BEGIN_ALLOW_THREADS
@@ -398,31 +463,41 @@ py_write_lockspace(PyObject *self __unused, PyObject *args, PyObject *keywds)
 
 /* read_lockspace */
 PyDoc_STRVAR(pydoc_read_lockspace, "\
-read_lockspace(path, offset=0) -> dict\n\
-Read the lockspace information from a device at a specific offset.");
+read_lockspace(path, offset=0, align=1048576, sector=512)\n -> dict\n\
+Read the lockspace information from a device at a specific offset.\n\
+Align can be one of (1048576, 2097152, 4194304, 8388608).\n\
+Sector can be one of (512, 4096).");
 
 static PyObject *
 py_read_lockspace(PyObject *self __unused, PyObject *args, PyObject *keywds)
 {
-    int rv;
+    int rv, sector = SECTOR_SIZE_512;
+    long align = ALIGNMENT_1M;
     uint32_t io_timeout = 0;
     const char *path;
     struct sanlk_lockspace ls;
     PyObject *ls_info = NULL, *ls_entry = NULL;
 
-    static char *kwlist[] = {"path", "offset", NULL};
+    static char *kwlist[] = {"path", "offset", "align", "sector", NULL};
 
     /* initialize lockspace structure */
     memset(&ls, 0, sizeof(struct sanlk_lockspace));
 
     /* parse python tuple */
-    if (!PyArg_ParseTupleAndKeywords(args, keywds, "s|k", kwlist,
-        &path, &ls.host_id_disk.offset)) {
+    if (!PyArg_ParseTupleAndKeywords(args, keywds, "s|kli", kwlist,
+        &path, &ls.host_id_disk.offset, &align, &sector)) {
         return NULL;
     }
 
     /* prepare sanlock names */
     strncpy(ls.host_id_disk.path, path, SANLK_PATH_LEN - 1);
+
+    /* set alignment/sector flags */
+    if (add_align_flag(align, &ls.flags) == -1)
+        return NULL;
+
+    if (add_sector_flag(sector, &ls.flags) == -1)
+        return NULL;
 
     /* read sanlock lockspace (gil disabled) */
     Py_BEGIN_ALLOW_THREADS
@@ -465,18 +540,21 @@ exit_fail:
 
 /* read_resource */
 PyDoc_STRVAR(pydoc_read_resource, "\
-read_resource(path, offset=0) -> dict\n\
-Read the resource information from a device at a specific offset.");
+read_resource(path, offset=0, align=1048576, sector=512) -> dict\n\
+Read the resource information from a device at a specific offset.\n\
+Align can be one of (1048576, 2097152, 4194304, 8388608).\n\
+Sector can be one of (512, 4096).");
 
 static PyObject *
 py_read_resource(PyObject *self __unused, PyObject *args, PyObject *keywds)
 {
-    int rv, rs_len;
+    int rv, rs_len, sector = SECTOR_SIZE_512;
+    long align = ALIGNMENT_1M;
     const char *path;
     struct sanlk_resource *rs;
     PyObject *rs_info = NULL, *rs_entry = NULL;
 
-    static char *kwlist[] = {"path", "offset", NULL};
+    static char *kwlist[] = {"path", "offset", "align", "sector", NULL};
 
     /* allocate the needed memory for the resource and one disk */
     rs_len = sizeof(struct sanlk_resource) + sizeof(struct sanlk_disk);
@@ -492,13 +570,20 @@ py_read_resource(PyObject *self __unused, PyObject *args, PyObject *keywds)
     rs->num_disks = 1;
 
     /* parse python tuple */
-    if (!PyArg_ParseTupleAndKeywords(args, keywds, "s|k", kwlist,
-        &path, &(rs->disks[0].offset))) {
+    if (!PyArg_ParseTupleAndKeywords(args, keywds, "s|kli", kwlist,
+        &path, &(rs->disks[0].offset), &align, &sector)) {
         goto exit_fail;
     }
 
     /* prepare the resource disk path */
     strncpy(rs->disks[0].path, path, SANLK_PATH_LEN - 1);
+
+    /* set alignment/sector flags */
+    if (add_align_flag(align, &rs->flags) == -1)
+        goto exit_fail;
+
+    if (add_sector_flag(sector, &rs->flags) == -1)
+        goto exit_fail;
 
     /* read sanlock resource (gil disabled) */
     Py_BEGIN_ALLOW_THREADS
@@ -552,28 +637,31 @@ exit_fail:
 /* write_resource */
 PyDoc_STRVAR(pydoc_write_resource, "\
 write_resource(lockspace, resource, disks, max_hosts=0, num_hosts=0, \
-clear=False)\n\
+clear=False, align=1048576, sector=512)\n\
 Initialize a device to be used as sanlock resource.\n\
 The disks must be in the format: [(path, offset), ... ].\n\
 If clear is True, the resource is cleared so subsequent read will\n\
-return an error.");
+return an error.\n\
+Align can be one of (1048576, 2097152, 4194304, 8388608).\n\
+Sector can be one of (512, 4096).");
 
 static PyObject *
 py_write_resource(PyObject *self __unused, PyObject *args, PyObject *keywds)
 {
-    int rv, max_hosts = 0, num_hosts = 0, clear = 0;
+    int rv, max_hosts = 0, num_hosts = 0, clear = 0, sector = SECTOR_SIZE_512;
+    long align = ALIGNMENT_1M;
     const char *lockspace, *resource;
     struct sanlk_resource *rs;
     PyObject *disks;
     uint32_t flags = 0;
 
     static char *kwlist[] = {"lockspace", "resource", "disks", "max_hosts",
-                                "num_hosts", "clear", NULL};
+                                "num_hosts", "clear", "align", "sector", NULL};
 
     /* parse python tuple */
-    if (!PyArg_ParseTupleAndKeywords(args, keywds, "ssO!|iii",
+    if (!PyArg_ParseTupleAndKeywords(args, keywds, "ssO!|iiili",
         kwlist, &lockspace, &resource, &PyList_Type, &disks, &max_hosts,
-        &num_hosts, &clear)) {
+        &num_hosts, &clear, &align, &sector)) {
         return NULL;
     }
 
@@ -585,6 +673,13 @@ py_write_resource(PyObject *self __unused, PyObject *args, PyObject *keywds)
     /* prepare sanlock names */
     strncpy(rs->lockspace_name, lockspace, SANLK_NAME_LEN);
     strncpy(rs->name, resource, SANLK_NAME_LEN);
+
+    /* set alignment/sector flags */
+    if (add_align_flag(align, &rs->flags) == -1)
+        goto exit_fail;
+
+    if (add_sector_flag(sector, &rs->flags) == -1)
+        goto exit_fail;
 
     if (clear) {
         flags |= SANLK_WRITE_CLEAR;
@@ -720,8 +815,9 @@ rem_lockspace(lockspace, host_id, path, offset=0, async=False, unused=False)\n\
 Remove a lockspace, releasing the acquired host_id. If async is True the\n\
 function will return immediately and the status can be checked using\n\
 inq_lockspace. If unused is True the command will fail (EBUSY) if there is\n\
-at least one acquired resource in the lockspace (instead of automatically\n\
-release it).");
+at least one acquired resource in the lockspace. Otherwise (the default)\n\
+sanlock will try to terminate processes holding resource leases and upon\n\
+successful termination these leases will be released.");
 
 static PyObject *
 py_rem_lockspace(PyObject *self __unused, PyObject *args, PyObject *keywds)
@@ -1101,26 +1197,32 @@ exit_fail:
 
 /* read_resource_owners */
 PyDoc_STRVAR(pydoc_read_resource_owners, "\
-read_resource_owners(lockspace, resource, disks) -> list\n\
+read_resource_owners(lockspace, resource, disks, align=1048576, sector=512) \
+-> list\n\
 Returns the list of hosts owning a resource, the list is not filtered and\n\
 it might contain hosts that are currently failing or dead. The hosts are\n\
 returned in the same format used by get_hosts.\n\
-The disks must be in the format: [(path, offset), ... ]");
+The disks must be in the format: [(path, offset), ... ].\n\
+Align can be one of (1048576, 2097152, 4194304, 8388608).\n\
+Sector can be one of (512, 4096).");
 
 static PyObject *
 py_read_resource_owners(PyObject *self __unused, PyObject *args, PyObject *keywds)
 {
     int rv, hss_count = 0;
+    int sector = SECTOR_SIZE_512;
+    long align = ALIGNMENT_1M;
     const char *lockspace, *resource;
     struct sanlk_resource *res = NULL;
     struct sanlk_host *hss = NULL;
     PyObject *disks, *ls_list = NULL;
 
-    static char *kwlist[] = {"lockspace", "resource", "disks", NULL};
+    static char *kwlist[] = {"lockspace", "resource", "disks", "align",
+                             "sector", NULL};
 
     /* parse python tuple */
-    if (!PyArg_ParseTupleAndKeywords(args, keywds, "ssO!", kwlist,
-        &lockspace, &resource, &PyList_Type, &disks)) {
+    if (!PyArg_ParseTupleAndKeywords(args, keywds, "ssO!|li", kwlist,
+        &lockspace, &resource, &PyList_Type, &disks, &align, &sector)) {
         return NULL;
     }
 
@@ -1132,6 +1234,14 @@ py_read_resource_owners(PyObject *self __unused, PyObject *args, PyObject *keywd
     /* prepare sanlock names */
     strncpy(res->lockspace_name, lockspace, SANLK_NAME_LEN);
     strncpy(res->name, resource, SANLK_NAME_LEN);
+
+    /* set resource alignment and sector flags */
+
+    if (add_align_flag(align, &res->flags) == -1)
+        goto exit_fail;
+
+    if (add_sector_flag(sector, &res->flags) == -1)
+        goto exit_fail;
 
     /* read resource owners (gil disabled) */
     Py_BEGIN_ALLOW_THREADS
@@ -1589,13 +1699,16 @@ initsanlock(void)
     if (py_module == NULL)
         return;
 
-    py_exception = initexception();
+    if (py_exception == NULL) {
+        py_exception = initexception();
+        if (py_exception == NULL)
+            return;
+    }
 
-    if (py_exception == NULL)
+    Py_INCREF(py_exception);
+    if (PyModule_AddObject(py_module, "SanlockException", py_exception)) {
+        Py_DECREF(py_exception);
         return;
-
-    if (PyModule_AddObject(py_module, "SanlockException", py_exception) == 0) {
-        Py_INCREF(py_exception);
     }
 
 #define PYSNLK_INIT_ADD_CONSTANT(x, y) \
@@ -1628,4 +1741,24 @@ initsanlock(void)
     PYSNLK_INIT_ADD_CONSTANT(SANLK_SETEV_ALL_HOSTS,      "SETEV_ALL_HOSTS");
 
 #undef PYSNLK_INIT_ADD_CONSTANT
+
+    /* Tuples with supported sector size and alignment values */
+    PyObject *sector = Py_BuildValue("ii", SECTOR_SIZE_512, SECTOR_SIZE_4K);
+    if (!sector)
+        return;
+    if (PyModule_AddObject(py_module, "SECTOR_SIZE", sector)) {
+        Py_DECREF(sector);
+        return;
+    }
+
+    PyObject *align = Py_BuildValue("llll", ALIGNMENT_1M, ALIGNMENT_2M, ALIGNMENT_4M, ALIGNMENT_8M);
+    if (!align)
+      return;
+    if (PyModule_AddObject(py_module, "ALIGN_SIZE", align)) {
+        Py_DECREF(align);
+	return;
+    }
+
 }
+
+/* vim: set expandtab shiftwidth=4 tabstop=4 : */

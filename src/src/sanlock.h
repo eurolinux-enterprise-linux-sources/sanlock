@@ -84,10 +84,16 @@ struct sanlk_disk {
  * host if the lockspace lease is cleanly released.
  */
 
-#define SANLK_RES_LVER		0x1	/* lver field is set */
-#define SANLK_RES_NUM_HOSTS	0x2	/* data32 field is new num_hosts */
-#define SANLK_RES_SHARED	0x4
-#define SANLK_RES_PERSISTENT	0x8
+#define SANLK_RES_LVER		0x00000001	/* lver field is set */
+#define SANLK_RES_NUM_HOSTS	0x00000002	/* data32 field is new num_hosts */
+#define SANLK_RES_SHARED	0x00000004
+#define SANLK_RES_PERSISTENT	0x00000008
+#define SANLK_RES_ALIGN1M	0x00000010
+#define SANLK_RES_ALIGN2M	0x00000020
+#define SANLK_RES_ALIGN4M	0x00000040
+#define SANLK_RES_ALIGN8M	0x00000080
+#define SANLK_RES_SECTOR512	0x00000100
+#define SANLK_RES_SECTOR4K	0x00000200
 
 struct sanlk_resource {
 	char lockspace_name[SANLK_NAME_LEN]; /* terminating \0 not required */
@@ -102,6 +108,29 @@ struct sanlk_resource {
 	struct sanlk_disk disks[0];
 };
 
+/* make these values match the RES equivalent in case of typos */
+#define SANLK_RIF_ALIGN1M	0x00000010
+#define SANLK_RIF_ALIGN2M	0x00000020
+#define SANLK_RIF_ALIGN4M	0x00000040
+#define SANLK_RIF_ALIGN8M	0x00000080
+#define SANLK_RIF_SECTOR512	0x00000100
+#define SANLK_RIF_SECTOR4K	0x00000200
+
+struct sanlk_rindex {
+	uint32_t flags;		/* SANLK_RIF_ */
+	uint32_t max_resources; /* the max res structs that will follow rindex */
+	uint64_t unused;
+	char lockspace_name[SANLK_NAME_LEN]; /* terminating \0 not required */
+	struct sanlk_disk disk; /* location of rindex */
+};
+
+struct sanlk_rentry {
+	char name[SANLK_NAME_LEN]; /* terminating \0 not required */
+	uint64_t offset;
+	uint32_t flags;
+	uint32_t unused;
+};
+
 /* command-specific command options (can include per resource data, but
    that requires the extra work of segmenting it by resource name) */
 
@@ -113,10 +142,21 @@ struct sanlk_options {
 	char str[0];
 };
 
+#define SANLK_LSF_ADD		0x00000001
+#define SANLK_LSF_REM		0x00000002
+
+/* make these values match the RES equivalent in case of typos */
+#define SANLK_LSF_ALIGN1M	0x00000010
+#define SANLK_LSF_ALIGN2M	0x00000020
+#define SANLK_LSF_ALIGN4M	0x00000040
+#define SANLK_LSF_ALIGN8M	0x00000080
+#define SANLK_LSF_SECTOR512	0x00000100
+#define SANLK_LSF_SECTOR4K	0x00000200
+
 struct sanlk_lockspace {
 	char name[SANLK_NAME_LEN];
 	uint64_t host_id;
-	uint32_t flags;
+	uint32_t flags; /* SANLK_LSF_ */
 	struct sanlk_disk host_id_disk;
 };
 

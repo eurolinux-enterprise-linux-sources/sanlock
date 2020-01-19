@@ -23,6 +23,7 @@
 #include <sched.h>
 #include <pwd.h>
 #include <grp.h>
+#include <ctype.h>
 #include <sys/types.h>
 #include <sys/prctl.h>
 #include <sys/wait.h>
@@ -55,8 +56,7 @@
 #include "helper.h"
 #include "timeouts.h"
 #include "paxos_lease.h"
-
-#define ONEMB 1048576
+#include "env.h"
 
 #define SIGRUNPATH 100 /* anything that's not SIGTERM/SIGKILL */
 
@@ -85,9 +85,10 @@ static char command[COMMAND_MAX];
 static int cmd_argc;
 static char **cmd_argv;
 static struct thread_pool pool;
-static struct random_data rand_data;
 static char rand_state[32];
 static pthread_mutex_t rand_mutex = PTHREAD_MUTEX_INITIALIZER;
+static const char *run_dir = NULL;
+static int privileged = 1;
 
 static void close_helper(void)
 {
@@ -553,7 +554,7 @@ static int client_using_space(struct client *cl, struct space *sp)
 			continue;
 
 		if (!cl->kill_count)
-			log_spoke(sp, token, "client_using_space pid %d", cl->pid);
+			log_token(token, "client_using_space pid %d", cl->pid);
 		if (sp->space_dead)
 			token->space_dead = sp->space_dead;
 		rv = 1;
@@ -867,7 +868,7 @@ static int main_loop(void)
 		}
 
 		free_lockspaces(0);
-		free_resources();
+		rem_resources();
 
 		gettimeofday(&now, NULL);
 		ms = time_diff(&last_check, &now);
@@ -1244,6 +1245,12 @@ static void process_connection(int ci)
 	case SM_CMD_GET_LVB:
 	case SM_CMD_SHUTDOWN_WAIT:
 	case SM_CMD_SET_EVENT:
+	case SM_CMD_FORMAT_RINDEX:
+	case SM_CMD_REBUILD_RINDEX:
+	case SM_CMD_UPDATE_RINDEX:
+	case SM_CMD_LOOKUP_RINDEX:
+	case SM_CMD_CREATE_RESOURCE:
+	case SM_CMD_DELETE_RESOURCE:
 		rv = client_suspend(ci);
 		if (rv < 0)
 			return;
@@ -1292,7 +1299,7 @@ static int setup_listener(void)
 	struct sockaddr_un addr;
 	int rv, fd, ci;
 
-	rv = sanlock_socket_address(&addr);
+	rv = sanlock_socket_address(run_dir, &addr);
 	if (rv < 0)
 		return rv;
 
@@ -1379,16 +1386,15 @@ int get_rand(int a, int b);
 
 int get_rand(int a, int b)
 {
-	int32_t val;
-	int rv;
+	long int rv;
 
 	pthread_mutex_lock(&rand_mutex);
-	rv = random_r(&rand_data, &val);
+	rv = random();
 	pthread_mutex_unlock(&rand_mutex);
 	if (rv < 0)
 		return rv;
 
-	return a + (int) (((float)(b - a + 1)) * val / (RAND_MAX+1.0));
+	return a + (int) (((float)(b - a + 1)) * rv / (RAND_MAX+1.0));
 }
 
 static void setup_host_name(void)
@@ -1398,9 +1404,7 @@ static void setup_host_name(void)
 	uuid_t uu;
 
 	memset(rand_state, 0, sizeof(rand_state));
-	memset(&rand_data, 0, sizeof(rand_data));
-
-	initstate_r(time(NULL), rand_state, sizeof(rand_state), &rand_data);
+	initstate(time(NULL), rand_state, sizeof(rand_state));
 
 	/* use host name from command line */
 
@@ -1428,6 +1432,9 @@ static void setup_limits(void)
 	int rv;
 	struct rlimit rlim = { .rlim_cur = -1, .rlim_max= -1 };
 
+	if (!privileged)
+		return;
+
 	rv = setrlimit(RLIMIT_MEMLOCK, &rlim);
 	if (rv < 0) {
 		log_error("cannot set the limits for memlock %i", errno);
@@ -1451,7 +1458,7 @@ static void setup_groups(void)
 {
 	int rv;
 
-	if (!com.uname || !com.gname)
+	if (!com.uname || !com.gname || !privileged)
 		return;
 
 	rv = initgroups(com.uname, com.gid);
@@ -1464,7 +1471,7 @@ static void setup_uid_gid(void)
 {
 	int rv;
 
-	if (!com.uname || !com.gname)
+	if (!com.uname || !com.gname || !privileged)
 		return;
 
 	rv = setgid(com.gid);
@@ -1633,6 +1640,8 @@ static int do_daemon(void)
 {
 	int fd, rv;
 
+	run_dir = env_get(SANLOCK_RUN_DIR, DEFAULT_RUN_DIR);
+	privileged = env_get_bool(SANLOCK_PRIVILEGED, 1);
 
 	/* This can take a while so do it before forking. */
 	setup_groups();
@@ -1667,7 +1676,18 @@ static int do_daemon(void)
 	setup_signals();
 	setup_logging();
 
-	fd = lockfile(SANLK_RUN_DIR, SANLK_LOCKFILE_NAME, com.uid, com.gid);
+	if (strcmp(run_dir, DEFAULT_RUN_DIR))
+		log_warn("Using non-standard run directory '%s'", run_dir);
+
+	if (!privileged)
+		log_warn("Running in unprivileged mode");
+
+	/* If we run as root, make run_dir owned by root, so we can create the
+	 * lockfile when selinux disables DAC_OVERRIDE.
+	 * See https://danwalsh.livejournal.com/79643.html */
+
+	fd = lockfile(run_dir, SANLK_LOCKFILE_NAME, com.uid,
+		      privileged ? 0 : com.gid);
 	if (fd < 0) {
 		close_logging();
 		return fd;
@@ -1677,8 +1697,7 @@ static int do_daemon(void)
 
 	setup_uid_gid();
 
-	log_level(0, 0, NULL, LOG_WARNING, "sanlock daemon started %s host %s",
-		  VERSION, our_host_name_global);
+	log_warn("sanlock daemon started %s host %s", VERSION, our_host_name_global);
 
 	setup_priority();
 
@@ -1709,7 +1728,7 @@ static int do_daemon(void)
  out:
 	/* order reversed from setup so lockfile is last */
 	close_logging();
-	unlink_lockfile(fd, SANLK_RUN_DIR, SANLK_LOCKFILE_NAME);
+	close(fd);
 	return rv;
 }
 
@@ -1741,9 +1760,147 @@ static int group_to_gid(char *arg)
 	return gr->gr_gid;
 }
 
+static int parse_arg_rentry(char *str)
+{
+	char *name = NULL;
+	char *offset = NULL;
+
+	if (!str)
+		return -EINVAL;
+
+	/* "-r :1M" can be used to specify only an offset */
+	if (str[0] != ':')
+		name = str;
+
+	if ((offset = strchr(str, ':'))) {
+		uint64_t offnum;
+		char *m ;
+
+		*offset = '\0';
+		offset++;
+
+		if ((m = strchr(offset, 'M'))) {
+			*m = '\0';
+			offnum = atoll(offset) * 1024 * 1024;
+		} else {
+			offnum = atoll(offset);
+		}
+		com.rentry.offset = offnum;
+	}
+
+	if (name)
+		strncpy(com.rentry.name, name, SANLK_NAME_LEN);
+
+	return 0;
+}
+
+static int parse_arg_rindex(char *str)
+{
+	char *ls_name = NULL;
+	char *path = NULL;
+	char *offset = NULL;
+	int i;
+
+	if (!str)
+		return -EINVAL;
+
+	ls_name = &str[0];
+
+	for (i = 0; i < strlen(str); i++) {
+		if (str[i] == '\\') {
+			i++;
+			continue;
+		}
+
+		if (str[i] == ':') {
+			if (!path)
+				path = &str[i];
+			else if (!offset)
+				offset = &str[i];
+		}
+	}
+
+	if (path) {
+		*path = '\0';
+		path++;
+	}
+	if (offset) {
+		*offset= '\0';
+		offset++;
+	}
+
+	if (ls_name)
+		strncpy(com.rindex.lockspace_name, ls_name, SANLK_NAME_LEN);
+
+	if (path)
+		sanlock_path_import(com.rindex.disk.path, path, sizeof(com.rindex.disk.path));
+
+	if (offset) {
+		uint64_t offnum;
+		char *m ;
+
+		if ((m = strchr(offset, 'M'))) {
+			*m = '\0';
+			offnum = atoll(offset) * 1024 * 1024;
+		} else {
+			offnum = atoll(offset);
+		}
+		com.rindex.disk.offset = offnum;
+	}
+
+	return 0;
+}
+
+/* <lockspace_name>:<host_id>:<path>:<offset> */
+
 static int parse_arg_lockspace(char *arg)
 {
-	sanlock_str_to_lockspace(arg, &com.lockspace);
+	char offstr[16];
+	char *colon1, *colon2, *colon3, *m, *p;
+	uint64_t offnum = 0;
+	char *arg2 = NULL;
+	int len = strlen(arg);
+	int len2 = 0;
+	int i;
+
+	/*
+	 * If the arg string uses an offset with the 'M' suffix, then
+	 * convert it to a string without 'M'.
+	 */
+	if ((colon1 = strchr(arg, ':'))) {
+		if ((colon2 = strchr(colon1+1, ':'))) {
+			if ((colon3 = strchr(colon2+1, ':'))) {
+
+				if ((m = strchr(colon3+1, 'M'))) {
+					p = colon3+1;
+					i = 0;
+					while (1) {
+						offstr[i++] = *p;
+						p++;
+						if (p == m)
+							break;
+					}
+					offnum = atoll(offstr) * 1024 * 1024;
+
+					/* terminate 'arg' before offset */
+					*colon3 = '\0';
+
+					len2 = len + 64;
+					arg2 = malloc(len2);
+					if (!arg2)
+						return -1;
+					memset(arg2, 0, len2);
+
+					snprintf(arg2, len2, "%s:%llu", arg, (unsigned long long)offnum);
+				}
+			}
+		}
+	}
+
+	if (arg2)
+		sanlock_str_to_lockspace(arg2, &com.lockspace);
+	else
+		sanlock_str_to_lockspace(arg, &com.lockspace);
 
 	log_debug("lockspace %s host_id %llu path %s offset %llu",
 		  com.lockspace.name,
@@ -1754,9 +1911,17 @@ static int parse_arg_lockspace(char *arg)
 	return 0;
 }
 
+/* <lockspace_name>:<resource_name>:<path>:<offset>[:<lver>] */
+
 static int parse_arg_resource(char *arg)
 {
 	struct sanlk_resource *res;
+	char offstr[16];
+	char *colon1, *colon2, *colon3, *colon4, *m, *p;
+	uint64_t offnum = 0;
+	char *arg2 = NULL;
+	int len = strlen(arg);
+	int len2 = 0;
 	int rv, i;
 
 	if (com.res_count >= SANLK_MAX_RESOURCES) {
@@ -1764,7 +1929,51 @@ static int parse_arg_resource(char *arg)
 		return -1;
 	}
 
-	rv = sanlock_str_to_res(arg, &res);
+	memset(offstr, 0, sizeof(offstr));
+
+	/*
+	 * If the arg string uses an offset with the 'M' suffix, then
+	 * convert it to a string without 'M'.
+	 */
+	if ((colon1 = strchr(arg, ':'))) {
+		if ((colon2 = strchr(colon1+1, ':'))) {
+			if ((colon3 = strchr(colon2+1, ':'))) {
+				colon4 = strchr(colon3+1, ':'); /* optional */
+
+				if ((m = strchr(colon3+1, 'M'))) {
+					p = colon3+1;
+					i = 0;
+					while (1) {
+						offstr[i++] = *p;
+						p++;
+						if (p == m)
+							break;
+					}
+					offnum = atoll(offstr) * 1024 * 1024;
+
+					/* terminate 'arg' before offset */
+					*colon3 = '\0';
+
+					len2 = len + 64;
+					arg2 = malloc(len2);
+					if (!arg2)
+						return -1;
+					memset(arg2, 0, len2);
+
+					if (!colon4)
+						snprintf(arg2, len2, "%s:%llu", arg, (unsigned long long)offnum);
+					else
+						snprintf(arg2, len2, "%s:%llu%s", arg, (unsigned long long)offnum, colon4);
+				}
+			}
+		}
+	}
+
+	if (arg2)
+		rv = sanlock_str_to_res(arg2, &res);
+	else
+		rv = sanlock_str_to_res(arg, &res);
+
 	if (rv < 0) {
 		log_tool("resource arg parse error %d\n", rv);
 		return rv;
@@ -1810,7 +2019,7 @@ static void print_usage(void)
 	printf("  -Q 0|1        quiet error messages for common lock contention (%d)\n", DEFAULT_QUIET_FAIL);
 	printf("  -R 0|1        renewal debugging, log debug info about renewals (0)\n");
 	printf("  -H <num>      renewal history size (%d)\n", DEFAULT_RENEWAL_HISTORY_SIZE);
-	printf("  -L <pri>      write logging at priority level and up to logfile (3 LOG_ERR)\n");
+	printf("  -L <pri>      write logging at priority level and up to logfile (4 LOG_WARNING)\n");
 	printf("                (use -1 for none)\n");
 	printf("  -S <pri>      write logging at priority level and up to syslog (3 LOG_ERR)\n");
 	printf("                (use -1 for none)\n");
@@ -1835,9 +2044,8 @@ static void print_usage(void)
 	printf("sanlock client set_config -s LOCKSPACE [-u 0|1] [-O 0|1]\n");
 	printf("sanlock client log_dump\n");
 	printf("sanlock client shutdown [-f 0|1] [-w 0|1]\n");
-	printf("sanlock client init -s LOCKSPACE | -r RESOURCE [-z 0|1]\n");
-	printf("sanlock client read -s LOCKSPACE | -r RESOURCE\n");
-	printf("sanlock client align -s LOCKSPACE\n");
+	printf("sanlock client init -s LOCKSPACE | -r RESOURCE [-z 0|1] [-Z 512|4096 -A 1M|2M|4M|8M]\n");
+	printf("sanlock client read -s LOCKSPACE | -r RESOURCE [-D]\n");
 	printf("sanlock client add_lockspace -s LOCKSPACE\n");
 	printf("sanlock client inq_lockspace -s LOCKSPACE\n");
 	printf("sanlock client rem_lockspace -s LOCKSPACE\n");
@@ -1848,11 +2056,21 @@ static void print_usage(void)
 	printf("sanlock client inquire -p <pid>\n");
 	printf("sanlock client request -r RESOURCE -f <force_mode>\n");
 	printf("sanlock client examine -r RESOURCE | -s LOCKSPACE\n");
+	printf("sanlock client format -x RINDEX [-Z 512|4096 -A 1M|2M|4M|8M]\n");
+	printf("sanlock client create -x RINDEX -e <resource_name>\n");
+	printf("sanlock client delete -x RINDEX -e <resource_name>[:<offset>]\n");
+	printf("sanlock client lookup -x RINDEX [-e <resource_name>:<offset>]\n");
+	printf("sanlock client update -x RINDEX -e <resource_name>[:<offset>] [-z 0|1]\n");
+	printf("sanlock client rebuild -x RINDEX\n");
 	printf("\n");
-	printf("sanlock direct <action> [-a 0|1] [-o 0|1]\n");
-	printf("sanlock direct init -s LOCKSPACE | -r RESOURCE\n");
+	printf("sanlock direct <action> [-a 0|1] [-o 0|1] [-Z 512|4096 -A 1M|2M|4M|8M]\n");
+	printf("sanlock direct init -s LOCKSPACE | -r RESOURCE [-Z 512|4096 -A 1M|2M|4M|8M]\n");
 	printf("sanlock direct read_leader -s LOCKSPACE | -r RESOURCE\n");
 	printf("sanlock direct dump <path>[:<offset>[:<size>]]\n");
+	printf("sanlock direct format -x RINDEX [-Z 512|4096 -A 1M|2M|4M|8M]\n");
+	printf("sanlock direct lookup -x RINDEX [-e <resource_name>:<offset>]\n");
+	printf("sanlock direct update -x RINDEX -e <resource_name>[:<offset>] [-z 0|1]\n");
+	printf("sanlock direct rebuild -x RINDEX\n");
 	printf("\n");
 	printf("LOCKSPACE = <lockspace_name>:<host_id>:<path>:<offset>\n");
 	printf("  <lockspace_name>	name of lockspace\n");
@@ -1867,12 +2085,16 @@ static void print_usage(void)
 	printf("  <offset>		offset on path (bytes)\n");
 	printf("  <lver>                optional leader version or SH for shared lease\n");
 	printf("\n");
+	printf("RINDEX = <lockspace_name>:<path>:<offset>\n");
+	printf("  <lockspace_name>	name of lockspace\n");
+	printf("  <path>		path to storage reserved for leases\n");
+	printf("  <offset>		offset on path (bytes)\n");
+	printf("\n");
 	printf("Limits:\n");
-	printf("offset alignment with 512 byte sectors: %d (1MB)\n", 1024 * 1024);
-	printf("offset alignment with 4096 byte sectors: %d (8MB)\n", 1024 * 1024 * 8);
+	printf("valid sector/align size combinations: 512/1M, 4K/1M, 4K/2M, 4K/4M, 4K/8M\n");
+	printf("maximum host_id for sector/align sizes: 2000, 250, 500, 1000, 2000\n");
 	printf("maximum name length for lockspaces and resources: %d\n", SANLK_NAME_LEN);
 	printf("maximum path length: %d\n", SANLK_PATH_LEN);
-	printf("maximum host_id: %d\n", DEFAULT_MAX_HOSTS);
 	printf("maximum client process connections: 1000\n"); /* NALLOC */
 	printf("\n");
 }
@@ -1981,7 +2203,25 @@ static int read_command_line(int argc, char *argv[])
 			com.action = ACT_SET_EVENT;
 		else if (!strcmp(act, "set_config"))
 			com.action = ACT_SET_CONFIG;
-		else {
+		else if (!strcmp(act, "format")) {
+			com.action = ACT_FORMAT;
+			com.rindex_op = RX_OP_FORMAT;
+		} else if (!strcmp(act, "rebuild")) {
+			com.action = ACT_REBUILD;
+			com.rindex_op = RX_OP_REBUILD;
+		} else if (!strcmp(act, "create")) {
+			com.action = ACT_CREATE;
+			com.rindex_op = RX_OP_CREATE;
+		} else if (!strcmp(act, "delete")) {
+			com.action = ACT_DELETE;
+			com.rindex_op = RX_OP_DELETE;
+		} else if (!strcmp(act, "lookup")) {
+			com.action = ACT_LOOKUP;
+			com.rindex_op = RX_OP_LOOKUP;
+		} else if (!strcmp(act, "update")) {
+			com.action = ACT_UPDATE;
+			com.rindex_op = RX_OP_UPDATE;
+		} else {
 			log_tool("client action \"%s\" is unknown", act);
 			exit(EXIT_FAILURE);
 		}
@@ -2008,7 +2248,19 @@ static int read_command_line(int argc, char *argv[])
 			com.action = ACT_RELEASE_ID;
 		else if (!strcmp(act, "renew_id"))
 			com.action = ACT_RENEW_ID;
-		else {
+		else if (!strcmp(act, "format")) {
+			com.action = ACT_FORMAT;
+			com.rindex_op = RX_OP_FORMAT;
+		} else if (!strcmp(act, "rebuild")) {
+			com.action = ACT_REBUILD;
+			com.rindex_op = RX_OP_REBUILD;
+		} else if (!strcmp(act, "lookup")) {
+			com.action = ACT_LOOKUP;
+			com.rindex_op = RX_OP_LOOKUP;
+		} else if (!strcmp(act, "update")) {
+			com.action = ACT_UPDATE;
+			com.rindex_op = RX_OP_UPDATE;
+		} else {
 			log_tool("direct action \"%s\" is unknown", act);
 			exit(EXIT_FAILURE);
 		}
@@ -2118,8 +2370,12 @@ static int read_command_line(int argc, char *argv[])
 			com.he_data = strtoull(optionarg, NULL, 0);
 			break;
 		case 'e':
-			strncpy(com.our_host_name, optionarg, NAME_ID_SIZE);
-			com.he_event = strtoull(optionarg, NULL, 0);
+			if (com.rindex_op) {
+				parse_arg_rentry(optionarg);
+			} else {
+				strncpy(com.our_host_name, optionarg, NAME_ID_SIZE);
+				com.he_event = strtoull(optionarg, NULL, 0);
+			}
 			break;
 		case 'i':
 			com.host_id = strtoull(optionarg, NULL, 0);
@@ -2161,6 +2417,9 @@ static int read_command_line(int argc, char *argv[])
 			com.used_set = 1;
 			com.used = atoi(optionarg);
 			break;
+		case 'x':
+			parse_arg_rindex(optionarg);
+			break;
 		case 'z':
 			com.clear_arg = 1;
 			break;
@@ -2168,6 +2427,22 @@ static int read_command_line(int argc, char *argv[])
 		case 'c':
 			begin_command = 1;
 			break;
+
+		case 'A':
+			if (!strcmp(optionarg, "1M"))
+				com.align_size = ALIGN_SIZE_1M;
+			else if (!strcmp(optionarg, "2M"))
+				com.align_size = ALIGN_SIZE_2M;
+			else if (!strcmp(optionarg, "4M"))
+				com.align_size = ALIGN_SIZE_4M;
+			else if (!strcmp(optionarg, "8M"))
+				com.align_size = ALIGN_SIZE_8M;
+			break;
+
+		case 'Z':
+			com.sector_size = atoi(optionarg);
+			break;
+
 		default:
 			log_tool("unknown option: %c", optchar);
 			exit(EXIT_FAILURE);
@@ -2178,6 +2453,20 @@ static int read_command_line(int argc, char *argv[])
 			break;
 
 		i++;
+	}
+
+	if (!com.sector_size && !com.align_size) {
+	} else if (com.sector_size && !com.align_size) {
+	} else if (((com.sector_size == 512) && (com.align_size == ALIGN_SIZE_1M)) ||
+	    ((com.sector_size == 4096) && (com.align_size == ALIGN_SIZE_1M)) ||
+	    ((com.sector_size == 4096) && (com.align_size == ALIGN_SIZE_2M)) ||
+	    ((com.sector_size == 4096) && (com.align_size == ALIGN_SIZE_4M)) ||
+	    ((com.sector_size == 4096) && (com.align_size == ALIGN_SIZE_8M))) {
+	} else {
+		log_tool("Invalid sector_size/align_size combination (%d/%d)",
+			 com.sector_size, com.align_size);
+		log_tool("Use one of: 512/1M, 4096/1M, 4096/2M, 4096/4M, 4096/8M.");
+		return -EINVAL;
 	}
 
 	/*
@@ -2297,6 +2586,10 @@ static void read_config_file(void)
 			get_val_int(line, &val);
 			com.debug_renew = val;
 
+		} else if (!strcmp(str, "use_aio")) {
+			get_val_int(line, &val);
+			com.aio_arg = val;
+
 		} else if (!strcmp(str, "logfile_priority")) {
 			get_val_int(line, &val);
 			log_logfile_priority = val;
@@ -2308,6 +2601,10 @@ static void read_config_file(void)
 		} else if (!strcmp(str, "syslog_priority")) {
 			get_val_int(line, &val);
 			log_syslog_priority = val;
+
+		} else if (!strcmp(str, "names_log_priority")) {
+			get_val_int(line, &val);
+			com.names_log_priority = val;
 
 		} else if (!strcmp(str, "use_watchdog")) {
 			get_val_int(line, &val);
@@ -2355,6 +2652,38 @@ static void read_config_file(void)
 		} else if (!strcmp(str, "paxos_debug_all")) {
 			get_val_int(line, &val);
 			com.paxos_debug_all = val;
+
+		} else if (!strcmp(str, "debug_io")) {
+			memset(str, 0, sizeof(str));
+			get_val_str(line, str);
+			if (strstr(str, "submit"))
+				com.debug_io_submit = 1;
+			if (strstr(str, "complete"))
+				com.debug_io_complete = 1;
+
+		} else if (!strcmp(str, "max_sectors_kb")) {
+			memset(str, 0, sizeof(str));
+			get_val_str(line, str);
+			if (strstr(str, "ignore")) {
+				com.max_sectors_kb_ignore = 1;
+				com.max_sectors_kb_align = 0;
+				com.max_sectors_kb_num = 0;
+			} else if (strstr(str, "align")) {
+				com.max_sectors_kb_ignore = 0;
+				com.max_sectors_kb_align = 1;
+				com.max_sectors_kb_num = 0;
+			} else if (isdigit(str[0])) {
+				int num = atoi(str);
+				if (!num || (num % 2) || (num > 8192)) {
+					log_error("ignore invalid num max_sectors_kb %s", str);
+				} else {
+					com.max_sectors_kb_ignore = 0;
+					com.max_sectors_kb_align = 0;
+					com.max_sectors_kb_num = num;
+				}
+			} else {
+				log_error("ignore unknown max_sectors_kb %s", str);
+			}
 		}
 	}
 
@@ -2470,8 +2799,18 @@ static int do_client_read(void)
 	int rv, i, hss_count = 0;
 
 	if (com.lockspace.host_id_disk.path[0]) {
+		if (com.sector_size)
+			com.lockspace.flags |= sanlk_lsf_sector_size_to_flag(com.sector_size);
+		if (com.align_size)
+			com.lockspace.flags |= sanlk_lsf_align_size_to_flag(com.align_size);
+
 		rv = sanlock_read_lockspace(&com.lockspace, 0, &io_timeout);
 	} else {
+		if (com.sector_size)
+			com.res_args[0]->flags |= sanlk_res_sector_size_to_flag(com.sector_size);
+		if (com.align_size)
+			com.res_args[0]->flags |= sanlk_res_align_size_to_flag(com.align_size);
+
 		if (!com.get_hosts) {
 			rv = sanlock_read_resource(com.res_args[0], 0);
 		} else {
@@ -2491,7 +2830,11 @@ static int do_client_read(void)
 			 (unsigned long long)com.lockspace.host_id,
 			 com.lockspace.host_id_disk.path,
 			 (unsigned long long)com.lockspace.host_id_disk.offset);
-		log_tool("io_timeout %u", io_timeout);
+		if (com.debug) {
+			log_tool("io_timeout %u", io_timeout);
+			log_tool("sector_size %d", sanlk_lsf_sector_flag_to_size(com.lockspace.flags));
+			log_tool("align_size %d", sanlk_lsf_align_flag_to_size(com.lockspace.flags));
+		}
 		goto out;
 	}
 
@@ -2502,6 +2845,11 @@ static int do_client_read(void)
 	}
 
 	log_tool("r %s", res_str);
+
+	if (com.debug) {
+		log_tool("sector_size %d", sanlk_res_sector_flag_to_size(com.res_args[0]->flags));
+		log_tool("align_size %d", sanlk_res_align_flag_to_size(com.res_args[0]->flags));
+	}
 
 	free(res_str);
 
@@ -2761,15 +3109,27 @@ static int do_client(void)
 
 	case ACT_CLIENT_INIT:
 		log_tool("init");
-		if (com.lockspace.host_id_disk.path[0])
+		if (com.lockspace.host_id_disk.path[0]) {
+			if (com.sector_size)
+				com.lockspace.flags |= sanlk_lsf_sector_size_to_flag(com.sector_size);
+			if (com.align_size)
+				com.lockspace.flags |= sanlk_lsf_align_size_to_flag(com.align_size);
+
 			rv = sanlock_write_lockspace(&com.lockspace,
 						     com.max_hosts, 0,
 						     com.io_timeout_arg);
-		else
+		} else {
+			if (com.sector_size)
+				com.res_args[0]->flags |= sanlk_res_sector_size_to_flag(com.sector_size);
+			if (com.align_size)
+				com.res_args[0]->flags |= sanlk_res_align_size_to_flag(com.align_size);
+
 			rv = sanlock_write_resource(com.res_args[0],
 						    com.max_hosts,
 						    com.num_hosts,
 						    com.clear_arg ? SANLK_WRITE_CLEAR : 0);
+		}
+
 		log_tool("init done %d", rv);
 		break;
 
@@ -2804,9 +3164,52 @@ static int do_client(void)
 			config_cmd = com.used ? SANLK_CONFIG_USED :
 						SANLK_CONFIG_UNUSED;
 
-		log_tool("set_config %s %u", com.lockspace.name, config_cmd);
+		log_tool("set_config %.48s %u", com.lockspace.name, config_cmd);
 		rv = sanlock_set_config(com.lockspace.name, 0, config_cmd, NULL);
 		log_tool("set_config done %d", rv);
+		break;
+
+	case ACT_FORMAT:
+		if (com.sector_size)
+			com.rindex.flags |= sanlk_rif_sector_size_to_flag(com.sector_size);
+		if (com.align_size)
+			com.rindex.flags |= sanlk_rif_align_size_to_flag(com.align_size);
+
+		rv = sanlock_format_rindex(&com.rindex, 0);
+		log_tool("format done %d", rv);
+		break;
+
+	case ACT_REBUILD:
+		rv = sanlock_rebuild_rindex(&com.rindex, 0);
+		log_tool("rebuild done %d", rv);
+		break;
+
+	case ACT_CREATE:
+		rv = sanlock_create_resource(&com.rindex, 0, &com.rentry, 0, 0);
+		log_tool("create_resource done %d", rv);
+		if (!rv)
+			log_tool("offset %llu", (unsigned long long)com.rentry.offset);
+		break;
+
+	case ACT_DELETE:
+		rv = sanlock_delete_resource(&com.rindex, 0, &com.rentry);
+		log_tool("delete_resource done %d", rv);
+		break;
+
+	case ACT_LOOKUP:
+		rv = sanlock_lookup_rindex(&com.rindex, 0, &com.rentry);
+		log_tool("lookup done %d", rv);
+		if (!rv)
+			log_tool("name %.48s offset %llu",
+				  com.rentry.name[0] ? com.rentry.name : "-",
+				  (unsigned long long)com.rentry.offset);
+		break;
+
+	case ACT_UPDATE:
+		rv = sanlock_update_rindex(&com.rindex,
+					   com.clear_arg ? SANLK_RXUP_REM : SANLK_RXUP_ADD,
+					   &com.rentry);
+		log_tool("update done %d", rv);
 		break;
 
 	default:
@@ -3009,21 +3412,19 @@ static int do_direct_write_leader(void)
 		       (unsigned long long)com.lockspace.host_id_disk.offset);
 	} else {
 		rv = sanlock_res_to_str(com.res_args[0], &res_str);
-		if (rv < 0) {
-			syslog(LOG_WARNING, "write_leader resource %.48s:%.48s",
-			       com.res_args[0]->lockspace_name, com.res_args[0]->name);
-		} else {
-			syslog(LOG_WARNING, "write_leader resource %s", res_str);
-		}
+		if (rv < 0)
+			goto out;
+		syslog(LOG_WARNING, "write_leader resource %s", res_str);
 	}
 
 	rv = direct_write_leader(&main_task, com.io_timeout_arg,
 				 &com.lockspace, com.res_args[0],
 				 &leader);
-
+out:
 	log_tool("write_leader done %d", rv);
 
-	print_leader(&leader, is_ls);
+	if (!rv)
+		print_leader(&leader, is_ls);
 
 	if (res_str)
 		free(res_str);
@@ -3037,27 +3438,38 @@ static int do_direct_init(void)
 	int rv;
 
 	if (com.lockspace.host_id_disk.path[0]) {
-		syslog(LOG_WARNING, "init lockspace %.48s:%llu:%s:%llu",
+		if (com.sector_size)
+			com.lockspace.flags |= sanlk_lsf_sector_size_to_flag(com.sector_size);
+		if (com.align_size)
+			com.lockspace.flags |= sanlk_lsf_align_size_to_flag(com.align_size);
+
+		syslog(LOG_WARNING, "init lockspace %.48s:%llu:%s:%llu 0x%x",
 		       com.lockspace.name,
 		       (unsigned long long)com.lockspace.host_id,
 		       com.lockspace.host_id_disk.path,
-		       (unsigned long long)com.lockspace.host_id_disk.offset);
+		       (unsigned long long)com.lockspace.host_id_disk.offset,
+		       com.lockspace.flags);
 
 		rv = direct_write_lockspace(&main_task, &com.lockspace,
-					    com.max_hosts, com.io_timeout_arg);
+					    com.io_timeout_arg);
 	} else {
+		if (com.sector_size)
+			com.res_args[0]->flags |= sanlk_res_sector_size_to_flag(com.sector_size);
+		if (com.align_size)
+			com.res_args[0]->flags |= sanlk_res_align_size_to_flag(com.align_size);
+
 		rv = sanlock_res_to_str(com.res_args[0], &res_str);
 		if (rv < 0) {
-			syslog(LOG_WARNING, "init resource %.48s:%.48s",
-			       com.res_args[0]->lockspace_name, com.res_args[0]->name);
+			log_tool("res_to_str parsing error %d", rv);
+			goto out;
 		} else {
 			syslog(LOG_WARNING, "init resource %s", res_str);
 		}
 
 		rv = direct_write_resource(&main_task, com.res_args[0],
-					   com.max_hosts, com.num_hosts, com.clear_arg);
+					   com.num_hosts, com.clear_arg);
 	}
-
+ out:
 	log_tool("init done %d", rv);
 
 	if (res_str)
@@ -3069,6 +3481,7 @@ static int do_direct_init(void)
 static int do_direct(void)
 {
 	struct leader_record leader;
+	uint32_t cmd_flags = 0;
 	int rv;
 
 	/* we want a record of any out-of-band changes to disk */
@@ -3097,6 +3510,45 @@ static int do_direct(void)
 	
 	case ACT_WRITE_LEADER:
 		rv = do_direct_write_leader();
+		break;
+
+	case ACT_FORMAT:
+		if (com.sector_size)
+			com.rindex.flags |= sanlk_rif_sector_size_to_flag(com.sector_size);
+		if (com.align_size)
+			com.rindex.flags |= sanlk_rif_align_size_to_flag(com.align_size);
+
+		syslog(LOG_WARNING, "format rindex %.48s:%s:%llu 0x%x",
+		       com.rindex.lockspace_name,
+		       com.rindex.disk.path,
+		       (unsigned long long)com.rindex.disk.offset,
+		       com.rindex.flags);
+
+		rv = direct_rindex_format(&main_task, &com.rindex);
+		log_tool("format done %d", rv);
+		break;
+
+	case ACT_REBUILD:
+		rv = direct_rindex_rebuild(&main_task, &com.rindex, 0);
+		log_tool("rebuild done %d", rv);
+		break;
+
+	case ACT_LOOKUP:
+		rv = direct_rindex_lookup(&main_task, &com.rindex, &com.rentry, 0);
+		log_tool("lookup done %d", rv);
+		if (!rv)
+			log_tool("name %.48s offset %llu",
+				  com.rentry.name[0] ? com.rentry.name : "-",
+				  (unsigned long long)com.rentry.offset);
+		break;
+
+	case ACT_UPDATE:
+		if (com.clear_arg)
+			cmd_flags |= SANLK_RXUP_REM;
+		else
+			cmd_flags |= SANLK_RXUP_ADD;
+		rv = direct_rindex_update(&main_task, &com.rindex, &com.rentry, cmd_flags);
+		log_tool("update done %d", rv);
 		break;
 
 	case ACT_ACQUIRE:
@@ -3210,6 +3662,7 @@ int main(int argc, char *argv[])
 	com.use_watchdog = DEFAULT_USE_WATCHDOG;
 	com.high_priority = DEFAULT_HIGH_PRIORITY;
 	com.mlock_level = DEFAULT_MLOCK_LEVEL;
+	com.names_log_priority = LOG_WARNING;
 	com.max_worker_threads = DEFAULT_MAX_WORKER_THREADS;
 	com.io_timeout_arg = DEFAULT_IO_TIMEOUT;
 	com.aio_arg = DEFAULT_USE_AIO;
@@ -3220,6 +3673,9 @@ int main(int argc, char *argv[])
 	com.renewal_read_extend_sec = 0;
 	com.renewal_history_size = DEFAULT_RENEWAL_HISTORY_SIZE;
 	com.paxos_debug_all = 0;
+	com.max_sectors_kb_ignore = DEFAULT_MAX_SECTORS_KB_IGNORE;
+	com.max_sectors_kb_align = DEFAULT_MAX_SECTORS_KB_ALIGN;
+	com.max_sectors_kb_num = DEFAULT_MAX_SECTORS_KB_NUM;
 
 	if (getgrnam("sanlock") && getpwnam("sanlock")) {
 		com.uname = (char *)"sanlock";
@@ -3260,6 +3716,6 @@ int main(int argc, char *argv[])
 		break;
 	};
  out:
-	return rv;
+	return rv == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 

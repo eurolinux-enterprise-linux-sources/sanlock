@@ -46,6 +46,7 @@
 #include "direct.h"
 #include "task.h"
 #include "cmd.h"
+#include "rindex.h"
 
 /* from main.c */
 void client_resume(int ci);
@@ -367,22 +368,16 @@ static void cmd_acquire(struct task *task, struct cmd_args *ca)
 		}
 		token->host_id = spi.host_id;
 		token->host_generation = spi.host_generation;
+		token->space_id = spi.space_id;
 		token->pid = cl_pid;
 		token->io_timeout = spi.io_timeout;
+		token->sector_size = spi.sector_size; /* starting hint, may be changed */
+		token->align_size = spi.align_size; /* starting hint, may be changed */
 		if (cl->restricted & SANLK_RESTRICT_SIGKILL)
 			token->flags |= T_RESTRICT_SIGKILL;
 		if (cl->restricted & SANLK_RESTRICT_SIGTERM)
 			token->flags |= T_RESTRICT_SIGTERM;
 
-		/* save a record of what this token_id is for later debugging */
-		log_level(spi.space_id, token->token_id, NULL, LOG_WARNING,
-			  "resource %.48s:%.48s:%.256s:%llu%s for %d,%d,%d",
-			  token->r.lockspace_name,
-			  token->r.name,
-			  token->r.disks[0].path,
-			  (unsigned long long)token->r.disks[0].offset,
-			  (token->acquire_flags & SANLK_RES_SHARED) ? ":SH" : "",
-			  cl_ci, cl_fd, cl_pid);
 	}
 
 	for (i = 0; i < new_tokens_count; i++) {
@@ -405,9 +400,16 @@ static void cmd_acquire(struct task *task, struct cmd_args *ca)
 			default:
 				lvl = LOG_ERR;
 			}
-			log_level(0, token->token_id, NULL, lvl,
-				  "cmd_acquire %d,%d,%d acquire_token %d %s",
-				  cl_ci, cl_fd, cl_pid, rv, acquire_error_str(rv));
+
+			if (token->res_id)
+				log_level(token->space_id, token->res_id, NULL, lvl,
+					  "cmd_acquire %d,%d,%d acquire_token %d %s",
+					  cl_ci, cl_fd, cl_pid, rv, acquire_error_str(rv));
+			else
+				log_level(token->space_id, 0, NULL, lvl,
+					  "cmd_acquire %d,%d,%d acquire_token %s %d %s",
+					  cl_ci, cl_fd, cl_pid,
+					  token->r.name, rv, acquire_error_str(rv));
 			result = rv;
 			goto done;
 		}
@@ -1028,6 +1030,8 @@ static void cmd_request(struct task *task, struct cmd_args *ca)
 	}
 
 	token->io_timeout = spi.io_timeout;
+	token->sector_size = spi.sector_size;
+	token->align_size = spi.align_size;
 
 	error = request_token(task, token, force_mode, &owner_id,
 			      (ca->header.cmd_flags & SANLK_REQUEST_NEXT_LVER));
@@ -1495,6 +1499,8 @@ static void cmd_read_lockspace(struct task *task, struct cmd_args *ca)
 	struct sanlk_lockspace lockspace;
 	struct sync_disk sd;
 	uint64_t host_id;
+	int sector_size = 0;
+	int align_size = 0;
 	int io_timeout = 0;
 	int fd, rv, result;
 
@@ -1534,12 +1540,27 @@ static void cmd_read_lockspace(struct task *task, struct cmd_args *ca)
 		goto reply;
 	}
 
+	sector_size = sanlk_lsf_sector_flag_to_size(lockspace.flags);
+	align_size = sanlk_lsf_align_flag_to_size(lockspace.flags);
+
+	if (!sector_size) {
+		/* reads the first leader record to get sector size */
+		result = delta_read_lockspace_sizes(task, &sd, DEFAULT_IO_TIMEOUT, &sector_size, &align_size);
+		if (result < 0)
+			goto out_close;
+		if ((sector_size != 512) && (sector_size != 4096)) {
+			result = -EINVAL;
+			goto out_close;
+		}
+	}
+
 	/* sets ls->name and io_timeout */
-	result = delta_read_lockspace(task, &sd, host_id, &lockspace,
+	result = delta_read_lockspace(task, &sd, sector_size, align_size, host_id, &lockspace,
 				      DEFAULT_IO_TIMEOUT, &io_timeout);
 	if (result == SANLK_OK)
 		result = 0;
 
+ out_close:
 	close_disks(&sd, 1);
  reply:
 	log_debug("cmd_read_lockspace %d,%d done %d", ca->ci_in, fd, result);
@@ -1626,7 +1647,14 @@ static void cmd_read_resource(struct task *task, struct cmd_args *ca)
 
 	token->io_timeout = DEFAULT_IO_TIMEOUT;
 
-	/* sets res.lockspace_name, res.name, res.lver */
+	/*
+	 * These may be zero, in which case paxos_read_resource reads a 4K sector
+	 * and gets the values from the leader record.
+	 */
+	token->sector_size = sanlk_res_sector_flag_to_size(res.flags);
+	token->align_size = sanlk_res_align_flag_to_size(res.flags);
+
+	/* sets res.lockspace_name, res.name, res.lver, res.flags */
 	result = paxos_read_resource(task, token, &res);
 	if (result == SANLK_OK)
 		result = 0;
@@ -1720,6 +1748,13 @@ static void cmd_read_resource_owners(struct task *task, struct cmd_args *ca)
 
 	token->io_timeout = DEFAULT_IO_TIMEOUT;
 
+	/*
+	 * These may be zero, in which case paxos_read_resource reads a 4K sector
+	 * and gets the values from the leader record.
+	 */
+	token->sector_size = sanlk_res_sector_flag_to_size(res.flags);
+	token->align_size = sanlk_res_align_flag_to_size(res.flags);
+
 	send_buf = NULL;
 	send_len = 0;
 
@@ -1752,7 +1787,7 @@ static void cmd_write_lockspace(struct task *task, struct cmd_args *ca)
 {
 	struct sanlk_lockspace lockspace;
 	struct sync_disk sd;
-	int fd, rv, result, max_hosts;
+	int fd, rv, result;
 	int io_timeout = DEFAULT_IO_TIMEOUT;
 
 	fd = client[ca->ci_in].fd;
@@ -1765,18 +1800,20 @@ static void cmd_write_lockspace(struct task *task, struct cmd_args *ca)
 		goto reply;
 	}
 
-	log_debug("cmd_write_lockspace %d,%d %.48s:%llu:%s:%llu",
+	log_debug("cmd_write_lockspace %d,%d %.48s:%llu:%s:%llu 0x%x",
 		  ca->ci_in, fd, lockspace.name,
 		  (unsigned long long)lockspace.host_id,
 		  lockspace.host_id_disk.path,
-		  (unsigned long long)lockspace.host_id_disk.offset);
+		  (unsigned long long)lockspace.host_id_disk.offset,
+		  lockspace.flags);
 
 	if (!lockspace.host_id_disk.path[0]) {
 		result = -ENODEV;
 		goto reply;
 	}
 
-	max_hosts = ca->header.data;
+	/* No longer used, max_hosts is derived from sector/align sizes. */
+	/* max_hosts = ca->header.data; */
 
 	memset(&sd, 0, sizeof(struct sync_disk));
 	memcpy(&sd, &lockspace.host_id_disk, sizeof(struct sanlk_disk));
@@ -1791,7 +1828,7 @@ static void cmd_write_lockspace(struct task *task, struct cmd_args *ca)
 	if (ca->header.data2)
 		io_timeout = ca->header.data2;
 
-	result = delta_lease_init(task, io_timeout, &sd, lockspace.name, max_hosts);
+	result = delta_lease_init(task, &lockspace, io_timeout, &sd);
 
 	close_disks(&sd, 1);
  reply:
@@ -1806,7 +1843,7 @@ static void cmd_write_resource(struct task *task, struct cmd_args *ca)
 	struct token *token = NULL;
 	struct sanlk_resource res;
 	int token_len, disks_len;
-	int num_hosts, max_hosts;
+	int num_hosts;
 	int write_clear = 0;
 	int j, fd, rv, result;
 
@@ -1840,6 +1877,7 @@ static void cmd_write_resource(struct task *task, struct cmd_args *ca)
 	token->r.num_disks = res.num_disks;
 	memcpy(token->r.lockspace_name, res.lockspace_name, SANLK_NAME_LEN);
 	memcpy(token->r.name, res.name, SANLK_NAME_LEN);
+	token->r.flags = res.flags;
 
 	/*
 	 * receive sanlk_disk's / sync_disk's
@@ -1861,15 +1899,18 @@ static void cmd_write_resource(struct task *task, struct cmd_args *ca)
 		token->disks[j].fd = -1;
 	}
 
-	log_debug("cmd_write_resource %d,%d %.48s:%.48s:%.256s:%llu",
+	log_debug("cmd_write_resource %d,%d %.48s:%.48s:%.256s:%llu 0x%x",
 		  ca->ci_in, fd,
 		  token->r.lockspace_name,
 		  token->r.name,
 		  token->disks[0].path,
-		  (unsigned long long)token->r.disks[0].offset);
+		  (unsigned long long)token->r.disks[0].offset,
+		  res.flags);
 
 	num_hosts = ca->header.data;
-	max_hosts = ca->header.data2;
+
+	/* No longer used, max_hosts is derived from sector/align sizes. */
+	/* max_hosts = ca->header.data2; */
 
 	if (ca->header.cmd_flags & SANLK_WRITE_CLEAR)
 		write_clear = 1;
@@ -1882,7 +1923,7 @@ static void cmd_write_resource(struct task *task, struct cmd_args *ca)
 
 	token->io_timeout = DEFAULT_IO_TIMEOUT;
 
-	result = paxos_lease_init(task, token, num_hosts, max_hosts, write_clear);
+	result = paxos_lease_init(task, token, num_hosts, write_clear);
 
 	close_disks(token->disks, token->r.num_disks);
  reply:
@@ -1974,13 +2015,125 @@ static void cmd_set_event(struct task *task GNUC_UNUSED, struct cmd_args *ca)
 	        goto reply;
 	}
 
-	log_debug("set_lockspace_event %s", lockspace.name);
+	log_debug("set_lockspace_event %.48s", lockspace.name);
 
 	result = lockspace_set_event(&lockspace, &he, ca->header.cmd_flags);
 
 	log_debug("cmd_set_event result %d", result);
 reply:
 	send_result(fd, &ca->header, result);
+	client_resume(ca->ci_in);
+}
+
+static void cmd_format_rindex(struct task *task, struct cmd_args *ca)
+{
+	struct sanlk_rindex ri;
+	int fd, rv, result;
+
+	fd = client[ca->ci_in].fd;
+
+	rv = recv(fd, &ri, sizeof(struct sanlk_rindex), MSG_WAITALL);
+	if (rv != sizeof(struct sanlk_rindex)) {
+		log_error("cmd_format_rindex %d,%d recv %d %d",
+			   ca->ci_in, fd, rv, errno);
+		result = -ENOTCONN;
+		goto reply;
+	}
+
+	log_debug("cmd_format_rindex %d,%d %.48s %s:%llu",
+		  ca->ci_in, fd, ri.lockspace_name,
+		  ri.disk.path,
+		  (unsigned long long)ri.disk.offset);
+
+	result = rindex_format(task, &ri);
+ reply:
+	log_debug("cmd_format_rindex %d,%d done %d", ca->ci_in, fd, result);
+
+	send_result(fd, &ca->header, result);
+	client_resume(ca->ci_in);
+}
+
+static void cmd_rebuild_rindex(struct task *task, struct cmd_args *ca)
+{
+	struct sanlk_rindex ri;
+	int fd, rv, result;
+
+	fd = client[ca->ci_in].fd;
+
+	rv = recv(fd, &ri, sizeof(struct sanlk_rindex), MSG_WAITALL);
+	if (rv != sizeof(struct sanlk_rindex)) {
+		log_error("cmd_rebuild_rindex %d,%d recv %d %d",
+			   ca->ci_in, fd, rv, errno);
+		result = -ENOTCONN;
+		goto reply;
+	}
+
+	log_debug("cmd_rebuild_rindex %d,%d %.48s %s:%llu",
+		  ca->ci_in, fd, ri.lockspace_name,
+		  ri.disk.path,
+		  (unsigned long long)ri.disk.offset);
+
+	result = rindex_rebuild(task, &ri, ca->header.cmd_flags);
+ reply:
+	log_debug("cmd_rebuild_rindex %d,%d done %d", ca->ci_in, fd, result);
+
+	send_result(fd, &ca->header, result);
+	client_resume(ca->ci_in);
+}
+
+static void rindex_op(struct task *task, struct cmd_args *ca, const char *cmd, int op)
+{
+	struct sanlk_rindex ri;
+	struct sanlk_rentry re;
+	struct sanlk_rentry re_ret;
+	struct sm_header h;
+	int fd, rv, result;
+
+	memset(&re_ret, 0, sizeof(re_ret));
+
+	fd = client[ca->ci_in].fd;
+
+	rv = recv(fd, &ri, sizeof(struct sanlk_rindex), MSG_WAITALL);
+	if (rv != sizeof(struct sanlk_rindex)) {
+		log_error("%s %d,%d recv %d %d", cmd, ca->ci_in, fd, rv, errno);
+		result = -ENOTCONN;
+		goto reply;
+	}
+
+	rv = recv(fd, &re, sizeof(struct sanlk_rentry), MSG_WAITALL);
+	if (rv != sizeof(struct sanlk_rentry)) {
+		log_error("%s %d,%d recv %d %d", cmd, ca->ci_in, fd, rv, errno);
+		result = -ENOTCONN;
+		goto reply;
+	}
+
+	log_debug("%s %d,%d %.48s %s:%llu", cmd,
+		  ca->ci_in, fd, ri.lockspace_name,
+		  ri.disk.path,
+		  (unsigned long long)ri.disk.offset);
+
+	if (op == RX_OP_LOOKUP)
+		result = rindex_lookup(task, &ri, &re, &re_ret, ca->header.cmd_flags);
+	else if (op == RX_OP_UPDATE)
+		result = rindex_update(task, &ri, &re, &re_ret, ca->header.cmd_flags);
+	else if (op == RX_OP_CREATE)
+		result = rindex_create(task, &ri, &re, &re_ret, ca->header.data, ca->header.data2);
+	else if (op == RX_OP_DELETE)
+		result = rindex_delete(task, &ri, &re, &re_ret);
+	else
+		result = -EINVAL;
+
+ reply:
+	log_debug("%s %d,%d done %d", cmd, ca->ci_in, fd, result);
+
+	memcpy(&h, &ca->header, sizeof(struct sm_header));
+	h.version = SM_PROTO;
+	h.data = result;
+	h.data2 = 0;
+	h.length = sizeof(h) + sizeof(re_ret);
+	send(fd, &h, sizeof(h), MSG_NOSIGNAL);
+	send(fd, &re_ret, sizeof(re), MSG_NOSIGNAL);
+
 	client_resume(ca->ci_in);
 }
 
@@ -2051,6 +2204,24 @@ void call_cmd_thread(struct task *task, struct cmd_args *ca)
 	case SM_CMD_SET_EVENT:
 		cmd_set_event(task, ca);
 		break;
+	case SM_CMD_FORMAT_RINDEX:
+		cmd_format_rindex(task, ca);
+		break;
+	case SM_CMD_REBUILD_RINDEX:
+		cmd_rebuild_rindex(task, ca);
+		break;
+	case SM_CMD_UPDATE_RINDEX:
+		rindex_op(task, ca, "cmd_update_rindex", RX_OP_UPDATE);
+		break;
+	case SM_CMD_LOOKUP_RINDEX:
+		rindex_op(task, ca, "cmd_lookup_rindex", RX_OP_LOOKUP);
+		break;
+	case SM_CMD_CREATE_RESOURCE:
+		rindex_op(task, ca, "cmd_create_resource", RX_OP_CREATE);
+		break;
+	case SM_CMD_DELETE_RESOURCE:
+		rindex_op(task, ca, "cmd_delete_resource", RX_OP_DELETE);
+		break;
 	};
 }
 
@@ -2089,6 +2260,9 @@ static int print_state_daemon(char *str)
 		 "gid=%d "
 		 "uid=%d "
 		 "sh_retries=%d "
+		 "max_sectors_kb_ignore=%d "
+		 "max_sectors_kb_align=%d "
+		 "max_sectors_kb_num=%d "
 		 "use_aio=%d "
 		 "kill_grace_seconds=%d "
 		 "helper_pid=%d "
@@ -2110,6 +2284,9 @@ static int print_state_daemon(char *str)
 		 com.gid,
 		 com.uid,
 		 com.sh_retries,
+		 com.max_sectors_kb_ignore,
+		 com.max_sectors_kb_align,
+		 com.max_sectors_kb_num,
 		 main_task.use_aio,
 		 kill_grace_seconds,
 		 helper_pid,
@@ -2168,6 +2345,8 @@ static int print_state_lockspace(struct space *sp, char *str, const char *list_n
 		 "list=%s "
 		 "space_id=%u "
 		 "io_timeout=%d "
+		 "sector_size=%d "
+		 "align_size=%d "
 		 "host_generation=%llu "
 		 "renew_fail=%d "
 		 "space_dead=%d "
@@ -2186,6 +2365,8 @@ static int print_state_lockspace(struct space *sp, char *str, const char *list_n
 		 list_name,
 		 sp->space_id,
 		 sp->io_timeout,
+		 sp->sector_size,
+		 sp->align_size,
 		 (unsigned long long)sp->host_generation,
 		 sp->renew_fail,
 		 sp->space_dead,
@@ -2213,11 +2394,19 @@ static int print_state_resource(struct resource *r, char *str, const char *list_
 	snprintf(str, SANLK_STATE_MAXSTR-1,
 		 "list=%s "
 		 "flags=%x "
+		 "sector_size=%d "
+		 "align_size=%d "
 		 "lver=%llu "
+		 "reused=%u "
+		 "res_id=%u "
 		 "token_id=%u",
 		 list_name,
 		 r->flags,
+		 r->sector_size,
+		 r->align_size,
 		 (unsigned long long)r->leader.lver,
+		 r->reused,
+		 r->res_id,
 		 token_id);
 
 	return strlen(str) + 1;

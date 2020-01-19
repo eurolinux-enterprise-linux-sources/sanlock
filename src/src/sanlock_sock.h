@@ -10,7 +10,6 @@
 #ifndef __SANLOCK_SOCK_H__
 #define __SANLOCK_SOCK_H__
 
-#define SANLK_RUN_DIR "/var/run/sanlock"
 #define SANLK_SOCKET_NAME "sanlock.sock"
 
 #define SM_MAGIC 0x04282010
@@ -55,6 +54,12 @@ enum {
 	SM_CMD_SET_EVENT         = 32,
 	SM_CMD_SET_CONFIG        = 33,
 	SM_CMD_RENEWAL           = 34,
+	SM_CMD_FORMAT_RINDEX     = 35,
+	SM_CMD_UPDATE_RINDEX     = 36,
+	SM_CMD_LOOKUP_RINDEX     = 37,
+	SM_CMD_CREATE_RESOURCE   = 38,
+	SM_CMD_DELETE_RESOURCE   = 39,
+	SM_CMD_REBUILD_RINDEX    = 40,
 };
 
 #define SM_CB_GET_EVENT 1
@@ -89,7 +94,7 @@ struct sanlk_state {
 	char str[0]; /* string of internal state */
 };
 
-int sanlock_socket_address(struct sockaddr_un *addr);
+int sanlock_socket_address(const char *dir, struct sockaddr_un *addr);
 
 struct event_cb {
 	struct sm_header h;

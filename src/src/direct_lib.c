@@ -23,14 +23,26 @@
 #include "task.h"
 #include "timeouts.h"
 
-void log_level(uint32_t space_id GNUC_UNUSED, uint32_t token_id GNUC_UNUSED,
+void log_level(uint32_t space_id GNUC_UNUSED, uint32_t res_id GNUC_UNUSED,
 	       char *name GNUC_UNUSED,
 	       int level GNUC_UNUSED, const char *fmt GNUC_UNUSED, ...);
 
-void log_level(uint32_t space_id GNUC_UNUSED, uint32_t token_id GNUC_UNUSED,
+void log_level(uint32_t space_id GNUC_UNUSED, uint32_t res_id GNUC_UNUSED,
 	       char *name GNUC_UNUSED,
 	       int level GNUC_UNUSED, const char *fmt GNUC_UNUSED, ...)
 {
+}
+
+int lockspace_begin_rindex_op(char *space_name GNUC_UNUSED, int rindex_op GNUC_UNUSED, struct space_info *spi GNUC_UNUSED);
+int lockspace_begin_rindex_op(char *space_name GNUC_UNUSED, int rindex_op GNUC_UNUSED, struct space_info *spi GNUC_UNUSED)
+{
+	return -1;
+}
+
+int lockspace_clear_rindex_op(char *space_name GNUC_UNUSED);
+int lockspace_clear_rindex_op(char *space_name GNUC_UNUSED)
+{
+	return -1;
 }
 
 int lockspace_disk(char *space_name GNUC_UNUSED, struct sync_disk *disk GNUC_UNUSED);
@@ -85,7 +97,7 @@ static void setup_task_lib(struct task *task, int use_aio)
 }
 
 
-int sanlock_direct_write_lockspace(struct sanlk_lockspace *ls, int max_hosts,
+int sanlock_direct_write_lockspace(struct sanlk_lockspace *ls, int max_hosts_unused,
                                    uint32_t flags GNUC_UNUSED, uint32_t io_timeout)
 {
 	struct task task;
@@ -93,7 +105,7 @@ int sanlock_direct_write_lockspace(struct sanlk_lockspace *ls, int max_hosts,
 
 	setup_task_lib(&task, 1);
 
-	rv = direct_write_lockspace(&task, ls, max_hosts, io_timeout);
+	rv = direct_write_lockspace(&task, ls, io_timeout);
 
 	close_task_aio(&task);
 
@@ -101,7 +113,7 @@ int sanlock_direct_write_lockspace(struct sanlk_lockspace *ls, int max_hosts,
 }
 
 int sanlock_direct_write_resource(struct sanlk_resource *res,
-                                  int max_hosts, int num_hosts,
+                                  int max_hosts_unused, int num_hosts,
 				  uint32_t flags)
 {
 	struct task task;
@@ -109,7 +121,7 @@ int sanlock_direct_write_resource(struct sanlk_resource *res,
 
 	setup_task_lib(&task, 1);
 
-	rv = direct_write_resource(&task, res, max_hosts, num_hosts,
+	rv = direct_write_resource(&task, res, num_hosts,
 				   (flags & SANLK_WRITE_CLEAR) ? 1 : 0);
 
 	close_task_aio(&task);
@@ -119,7 +131,7 @@ int sanlock_direct_write_resource(struct sanlk_resource *res,
 
 int sanlock_direct_init(struct sanlk_lockspace *ls,
 			struct sanlk_resource *res,
-			int max_hosts, int num_hosts, int use_aio)
+			int max_hosts_unused, int num_hosts, int use_aio)
 {
 	struct task task;
 	int rv;
@@ -127,9 +139,9 @@ int sanlock_direct_init(struct sanlk_lockspace *ls,
 	setup_task_lib(&task, use_aio);
 
 	if (ls)
-		rv = direct_write_lockspace(&task, ls, max_hosts, 0);
+		rv = direct_write_lockspace(&task, ls, 0);
 	else
-		rv = direct_write_resource(&task, res, max_hosts, num_hosts, 0);
+		rv = direct_write_resource(&task, res, num_hosts, 0);
 
 	close_task_aio(&task);
 

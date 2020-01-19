@@ -5,10 +5,10 @@
 # of the GNU General Public License v.2.
 
 all:
-	python setup.py build
+	python2 setup.py build $(BUILDARGS)
 
 install:
-	python setup.py install --root=$(DESTDIR)
+	python2 setup.py install --root=$(DESTDIR)
 
 clean:
 	rm -rf build

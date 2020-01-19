@@ -4,6 +4,8 @@
 # modify, copy, or redistribute it subject to the terms and conditions
 # of the GNU General Public License v2 or (at your option) any later version.
 
+include ../common.mk
+
 CMD_TARGET = sanlock
 HEADER_TARGET = sanlock.h sanlock_rv.h sanlock_resource.h sanlock_admin.h sanlock_direct.h
 MAN_TARGET = sanlock.8
@@ -24,6 +26,7 @@ CMD_SOURCE = \
 	direct.c \
 	diskio.c \
 	ondisk.c \
+	sizeflags.c \
 	helper.c \
 	lockspace.c \
 	lockfile.c \
@@ -33,11 +36,13 @@ CMD_SOURCE = \
 	task.c \
 	timeouts.c \
 	resource.c \
+	rindex.c \
 	watchdog.c \
 	monotime.c \
 	cmd.c \
 	client_cmd.c \
-	sanlock_sock.c
+	sanlock_sock.c \
+	env.c
 
 LIB_ENTIRE_SOURCE = \
 	client.c \
@@ -45,73 +50,48 @@ LIB_ENTIRE_SOURCE = \
 	crc32c.c \
 	diskio.c \
 	ondisk.c \
+	sizeflags.c \
 	delta_lease.c \
 	paxos_lease.c \
+	rindex.c \
 	direct.c \
 	task.c \
 	timeouts.c \
 	direct_lib.c \
-	monotime.c
+	monotime.c \
+	env.c
 
 LIB_CLIENT_SOURCE = \
 	client.c \
-	sanlock_sock.c
+	sanlock_sock.c \
+	env.c
 
 LIBPC_ENTIRE_SOURCE = libsanlock.pc.in
 LIBPC_CLIENT_SOURCE = libsanlock_client.pc.in
-
-OPTIMIZE_FLAG = -O2 -Wp,-D_FORTIFY_SOURCE=2
-ifeq ($(DEBUG), 1)
-   OPTIMIZE_FLAG = -O0
-   CFLAGS += -g
-endif
-
-
-
-CFLAGS += -D_GNU_SOURCE \
-	-Wall \
-	-Wformat \
-	-Wformat-security \
-	-Wmissing-prototypes \
-	-Wnested-externs \
-	-Wpointer-arith \
-	-Wextra -Wshadow \
-	-Wcast-align \
-	-Wwrite-strings \
-	-Waggregate-return \
-	-Wstrict-prototypes \
-	-Winline \
-	-Wredundant-decls \
-	-Wno-sign-compare \
-	-Wno-strict-overflow \
-	-fexceptions \
-	-fasynchronous-unwind-tables \
-	-fdiagnostics-show-option \
-	$(OPTIMIZE_FLAG) \
-	$(NULL)
 
 VER=$(shell cat ../VERSION)
 CFLAGS += -DVERSION=\"$(VER)\"
 
 CMD_CFLAGS = $(CFLAGS) -fPIE -DPIE
+LIB_ENTIRE_CFLAGS = $(CFLAGS) -fPIC
+LIB_CLIENT_CFLAGS = $(CFLAGS) -fPIC
 
-CMD_LDFLAGS += -Wl,-z,now -Wl,-z,relro -pie
-CMD_LDADD += -lpthread -luuid -lrt -laio -lblkid -lsanlock -L../wdmd -lwdmd
+CMD_LDFLAGS = $(LDFLAGS) -Wl,-z,relro -pie
+LIB_ENTIRE_LDFLAGS = $(LDFLAGS) -Wl,-z,relro -pie
+LIB_CLIENT_LDFLAGS = $(LDFLAGS) -Wl,-z,relro -pie
 
-LIB_ENTIRE_LDFLAGS += -lpthread -lrt -laio -lblkid -L../wdmd -lwdmd
-LIB_ENTIRE_LDFLAGS += -Wl,-z,relro -pie
-
-LIB_CLIENT_LDFLAGS += -Wl,-z,relro -pie
+CMD_LDADD = -lpthread -luuid -lrt -laio -lblkid -lsanlock -L../wdmd -lwdmd
+LIB_ENTIRE_LDADD = -lpthread -lrt -laio -lblkid -L../wdmd -lwdmd
 
 all: $(LIBSO_ENTIRE_TARGET) $(LIBSO_CLIENT_TARGET) $(CMD_TARGET) $(LIBPC_ENTIRE_TARGET) $(LIBPC_CLIENT_TARGET)
 
 $(LIBSO_ENTIRE_TARGET): $(LIB_ENTIRE_SOURCE)
-	$(CC) $(CFLAGS) $(LIB_ENTIRE_LDFLAGS) -shared -fPIC -o $@ -Wl,-soname=$(LIB_ENTIRE_TARGET).so.$(SOMAJOR) $^
+	$(CC) $(LIB_ENTIRE_CFLAGS) $(LIB_ENTIRE_LDFLAGS) -shared -o $@ -Wl,-soname=$(LIB_ENTIRE_TARGET).so.$(SOMAJOR) $^ $(LIB_ENTIRE_LDADD)
 	ln -sf $(LIBSO_ENTIRE_TARGET) $(LIB_ENTIRE_TARGET).so
 	ln -sf $(LIBSO_ENTIRE_TARGET) $(LIB_ENTIRE_TARGET).so.$(SOMAJOR)
 
 $(LIBSO_CLIENT_TARGET): $(LIB_CLIENT_SOURCE)
-	$(CC) $(CFLAGS) $(LIB_CLIENT_LDFLAGS) -shared -fPIC -o $@ -Wl,-soname=$(LIB_CLIENT_TARGET).so.$(SOMAJOR) $^
+	$(CC) $(LIB_CLIENT_CFLAGS) $(LIB_CLIENT_LDFLAGS) -shared -o $@ -Wl,-soname=$(LIB_CLIENT_TARGET).so.$(SOMAJOR) $^
 	ln -sf $(LIBSO_CLIENT_TARGET) $(LIB_CLIENT_TARGET).so
 	ln -sf $(LIBSO_CLIENT_TARGET) $(LIB_CLIENT_TARGET).so.$(SOMAJOR)
 

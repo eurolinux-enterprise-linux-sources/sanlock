@@ -23,6 +23,7 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/un.h>
+#include <sys/stat.h>
 
 #include "sanlock_internal.h"
 #include "sanlock_admin.h"
@@ -91,6 +92,18 @@ static struct space *find_lockspace_id(uint32_t space_id)
 	return NULL;
 }
 
+static void _set_space_info(struct space *sp, struct space_info *spi)
+{
+	/* keep this in sync with any new fields added to struct space_info */
+	spi->space_id = sp->space_id;
+	spi->io_timeout = sp->io_timeout;
+	spi->sector_size = sp->sector_size;
+	spi->align_size = sp->align_size;
+	spi->host_id = sp->host_id;
+	spi->host_generation = sp->host_generation;
+	spi->killing_pids = sp->killing_pids;
+}
+
 int _lockspace_info(const char *space_name, struct space_info *spi)
 {
 	struct space *sp;
@@ -99,15 +112,7 @@ int _lockspace_info(const char *space_name, struct space_info *spi)
 		if (strncmp(sp->space_name, space_name, NAME_ID_SIZE))
 			continue;
 
-		/* keep this in sync with any new fields added to
-		   struct space_info */
-
-		spi->space_id = sp->space_id;
-		spi->io_timeout = sp->io_timeout;
-		spi->host_id = sp->host_id;
-		spi->host_generation = sp->host_generation;
-		spi->killing_pids = sp->killing_pids;
-
+		_set_space_info(sp, spi);
 		return 0;
 	}
 	return -1;
@@ -124,7 +129,7 @@ int lockspace_info(const char *space_name, struct space_info *spi)
 	return rv;
 }
 
-int lockspace_disk(char *space_name, struct sync_disk *disk)
+int lockspace_disk(char *space_name, struct sync_disk *disk, int *sector_size)
 {
 	struct space *sp;
 	int rv = -1;
@@ -135,6 +140,7 @@ int lockspace_disk(char *space_name, struct sync_disk *disk)
 			continue;
 
 		memcpy(disk, &sp->host_id_disk, sizeof(struct sync_disk));
+		*sector_size = sp->sector_size;
 		disk->fd = -1;
 		rv = 0;
 	}
@@ -200,6 +206,9 @@ int host_status_set_bit(char *space_name, uint64_t host_id)
 	if (!found)
 		return -ENOSPC;
 
+	if (host_id > sp->max_hosts)
+		return -EINVAL;
+
 	pthread_mutex_lock(&sp->mutex);
 	sp->host_status[host_id-1].set_bit_time = monotime();
 	pthread_mutex_unlock(&sp->mutex);
@@ -210,6 +219,7 @@ int host_info(char *space_name, uint64_t host_id, struct host_status *hs_out)
 {
 	struct space *sp;
 	int found = 0;
+	int toobig = 0;
 
 	if (!host_id || host_id > DEFAULT_MAX_HOSTS)
 		return -EINVAL;
@@ -218,6 +228,10 @@ int host_info(char *space_name, uint64_t host_id, struct host_status *hs_out)
 	list_for_each_entry(sp, &spaces, list) {
 		if (strncmp(sp->space_name, space_name, NAME_ID_SIZE))
 			continue;
+		if (host_id > sp->max_hosts) {
+			toobig = 1;
+			break;
+		}
 		memcpy(hs_out, &sp->host_status[host_id-1], sizeof(struct host_status));
 		found = 1;
 
@@ -230,6 +244,8 @@ int host_info(char *space_name, uint64_t host_id, struct host_status *hs_out)
 	}
 	pthread_mutex_unlock(&spaces_mutex);
 
+	if (toobig)
+		return -EINVAL;
 	if (!found)
 		return -ENOSPC;
 	return 0;
@@ -244,7 +260,7 @@ static void create_bitmap_and_extra(struct space *sp, char *bitmap, struct delta
 	now = monotime();
 
 	pthread_mutex_lock(&sp->mutex);
-	for (i = 0; i < DEFAULT_MAX_HOSTS; i++) {
+	for (i = 0; i < sp->max_hosts; i++) {
 		if (i+1 == sp->host_id)
 			continue;
 
@@ -287,26 +303,23 @@ void check_other_leases(struct space *sp, char *buf)
 	struct leader_record leader_in;
 	struct leader_record *leader_end;
 	struct leader_record *leader;
-	struct sync_disk *disk;
 	struct host_status *hs;
 	struct sanlk_host_event he;
 	char *bitmap;
 	uint64_t now;
 	int i, new;
 
-	disk = &sp->host_id_disk;
-
 	now = monotime();
 	new = 0;
 
-	for (i = 0; i < DEFAULT_MAX_HOSTS; i++) {
+	for (i = 0; i < sp->max_hosts; i++) {
 		hs = &sp->host_status[i];
 		hs->last_check = now;
 
 		if (!hs->first_check)
 			hs->first_check = now;
 
-		leader_end = (struct leader_record *)(buf + (i * disk->sector_size));
+		leader_end = (struct leader_record *)(buf + (i * sp->sector_size));
 
 		leader_record_in(leader_end, &leader_in);
 		leader = &leader_in;
@@ -354,8 +367,7 @@ void check_other_leases(struct space *sp, char *buf)
 		if (!hs->lease_bad &&
 		    (strncmp(hs->owner_name, leader->resource_name, NAME_ID_SIZE) ||
 		     (hs->owner_generation != leader->owner_generation))) {
-			log_level(sp->space_id, 0, NULL, LOG_WARNING,
-				  "host %llu %llu %llu %.48s",
+			log_warns(sp, "host %llu %llu %llu %.48s",
 				  (unsigned long long)leader->owner_id,
 				  (unsigned long long)leader->owner_generation,
 				  (unsigned long long)leader->timestamp,
@@ -569,6 +581,79 @@ static void save_renewal_history(struct space *sp, int delta_result,
 	}
 }
 
+#define ONE_MB_IN_BYTES 1048576
+#define ONE_MB_IN_KB 1024
+
+static void set_lockspace_max_sectors_kb(struct space *sp, int sector_size, int align_size)
+{
+	struct stat st;
+	int align_size_kb = align_size / 1024; /* align_size is in bytes */
+	unsigned int hw_kb = 0;
+	unsigned int set_kb = 0;
+	int rv;
+
+	if (fstat(sp->host_id_disk.fd, &st) < 0) {
+		log_erros(sp, "set_lockspace_max_sectors_kb fstat error %d", errno);
+		return;
+	}
+
+	/* file not device */
+	if (S_ISREG(st.st_mode))
+		return;
+
+	if (com.max_sectors_kb_ignore)
+		return;
+	else if (com.max_sectors_kb_align)
+		set_kb = align_size_kb;
+	else if (com.max_sectors_kb_num)
+		set_kb = com.max_sectors_kb_num;
+	else
+		return;
+
+	rv = read_sysfs_size(sp->host_id_disk.path, "max_hw_sectors_kb", &hw_kb);
+	if (rv < 0 || !hw_kb) {
+		log_space(sp, "set_lockspace_max_sectors_kb max_hw_sectors_kb unknown %d %u", rv, hw_kb);
+		return;
+	}
+
+	if (hw_kb < set_kb) {
+		/*
+		 * If the hardware won't support requested size, try setting 1MB.
+		 */
+		if (hw_kb < ONE_MB_IN_KB) {
+			log_space(sp, "set_lockspace_max_sectors_kb small hw_kb %u req_kb %u", hw_kb, set_kb);
+			return;
+		}
+
+		if (set_kb < 1024) {
+			log_space(sp, "set_lockspace_max_sectors_kb small hw_kb %u small req_kb %u", hw_kb, set_kb);
+			return;
+		}
+
+		set_kb = ONE_MB_IN_KB;
+
+		log_space(sp, "set_lockspace_max_sectors_kb small hw_kb %u using 1024", hw_kb);
+
+		rv = set_max_sectors_kb(&sp->host_id_disk, set_kb);
+		if (rv < 0) {
+			log_space(sp, "set_lockspace_max_sectors_kb small hw_kb %u set 1024 error %d", hw_kb, rv);
+			return;
+		}
+	} else {
+		/*
+		 * Tell the kernel to send hardware io's as large as the lease size.
+		 */
+
+		log_space(sp, "set_lockspace_max_sectors_kb hw_kb %u setting %u", hw_kb, set_kb);
+
+		rv = set_max_sectors_kb(&sp->host_id_disk, set_kb);
+		if (rv < 0) {
+			log_space(sp, "set_lockspace_max_sectors_kb hw_kb %u set %u error %d", hw_kb, set_kb, rv);
+			return;
+		}
+	}
+}
+
 /*
  * This thread must not be stopped unless all pids that may be using any
  * resources in it are dead/gone.  (The USED flag in the lockspace represents
@@ -585,6 +670,9 @@ static void *lockspace_thread(void *arg_in)
 	struct space *sp;
 	struct leader_record leader;
 	uint64_t delta_begin, last_success = 0;
+	int sector_size = 0;
+	int align_size = 0;
+	int max_hosts = 0;
 	int log_renewal_level = -1;
 	int rv, delta_length, renewal_interval = 0;
 	int id_renewal_seconds, id_renewal_fail_seconds;
@@ -617,13 +705,41 @@ static void *lockspace_thread(void *arg_in)
 	}
 	opened = 1;
 
-	sp->align_size = direct_align(&sp->host_id_disk);
-	if (sp->align_size < 0) {
-		log_erros(sp, "direct_align error");
-		acquire_result = sp->align_size;
+	rv = delta_read_lockspace_sizes(&task, &sp->host_id_disk, sp->io_timeout, &sector_size, &align_size);
+	if (rv < 0) {
+		log_erros(sp, "failed to read device to find sector size error %d %s", rv, sp->host_id_disk.path);
+		acquire_result = rv;
 		delta_result = -1;
 		goto set_status;
 	}
+
+	if ((sector_size != 512) && (sector_size != 4096)) {
+		log_erros(sp, "failed to get valid sector size %d %s", sector_size, sp->host_id_disk.path);
+		acquire_result = SANLK_LEADER_SECTORSIZE;
+		delta_result = -1;
+		goto set_status;
+	}
+
+	max_hosts = size_to_max_hosts(sector_size, align_size);
+	if (!max_hosts) {
+		log_erros(sp, "invalid combination of sector size %d and align_size %d", sector_size, align_size);
+		acquire_result = SANLK_ADDLS_SIZES;
+		delta_result = -1;
+		goto set_status;
+	}
+
+	if (sp->host_id > max_hosts) {
+		log_erros(sp, "host_id %llu too large for max_hosts %d", (unsigned long long)sp->host_id, max_hosts);
+		acquire_result = SANLK_ADDLS_INVALID_HOSTID;
+		delta_result = -1;
+		goto set_status;
+	}
+
+	sp->sector_size = sector_size;
+	sp->align_size = align_size;
+	sp->max_hosts = max_hosts;
+
+	set_lockspace_max_sectors_kb(sp, sector_size, align_size);
 
 	sp->lease_status.renewal_read_buf = malloc(sp->align_size);
 	if (!sp->lease_status.renewal_read_buf) {
@@ -811,6 +927,7 @@ static void *lockspace_thread(void *arg_in)
 	 */
 
 	purge_resource_orphans(sp->space_name);
+	purge_resource_free(sp->space_name);
 
 	close_event_fds(sp);
 
@@ -944,8 +1061,7 @@ int add_lockspace_start(struct sanlk_lockspace *ls, uint32_t io_timeout, struct 
 	pthread_mutex_unlock(&spaces_mutex);
 
 	/* save a record of what this space_id is for later debugging */
-	log_level(sp->space_id, 0, NULL, LOG_WARNING,
-		  "lockspace %.48s:%llu:%.256s:%llu",
+	log_warns(sp, "lockspace %.48s:%llu:%.256s:%llu",
 		  sp->space_name,
 		  (unsigned long long)sp->host_id,
 		  sp->host_id_disk.path,
@@ -1093,6 +1209,13 @@ int rem_lockspace_start(struct sanlk_lockspace *ls, unsigned int *space_id)
 	if (!sp) {
 		pthread_mutex_unlock(&spaces_mutex);
 		rv = -ENOENT;
+		goto out;
+	}
+
+	if (sp->rindex_op) {
+		log_space(sp, "rem_lockspace ignored for rindex_op %d", sp->rindex_op);
+		pthread_mutex_unlock(&spaces_mutex);
+		rv = -EBUSY;
 		goto out;
 	}
 
@@ -1330,7 +1453,7 @@ int get_hosts(struct sanlk_lockspace *ls, char *buf, int *len, int *count, int m
 		goto out;
 	}
 
-	for (i = 0; i < DEFAULT_MAX_HOSTS; i++) {
+	for (i = 0; i < sp->max_hosts; i++) {
 		hs = &sp->host_status[i];
 
 		if (ls->host_id && (ls->host_id != (i + 1)))
@@ -1416,6 +1539,54 @@ int lockspace_set_config(struct sanlk_lockspace *ls, GNUC_UNUSED uint32_t flags,
 	return rv;
 }
 
+int lockspace_begin_rindex_op(char *space_name, int rindex_op, struct space_info *spi)
+{
+	struct space *sp;
+	int rv = 0;
+
+	pthread_mutex_lock(&spaces_mutex);
+	sp = _search_space(space_name, NULL, 0, &spaces, NULL, NULL, NULL);
+	if (!sp) {
+		rv = -ENOENT;
+		goto out;
+	}
+
+	/* space_dead and thread_stop are only set while
+	   spaces_mutex is held, so we don't need to lock sp->mutex */
+
+	if (sp->space_dead || sp->thread_stop) {
+		rv = -ENOSPC;
+		goto out;
+	}
+
+	if (sp->rindex_op) {
+		log_debug("being_rindex_op busy with %d", sp->rindex_op);
+		rv = -EBUSY;
+		goto out;
+	}
+
+	sp->rindex_op = rindex_op;
+	_set_space_info(sp, spi);
+out:
+	pthread_mutex_unlock(&spaces_mutex);
+	return rv;
+}
+
+int lockspace_clear_rindex_op(char *space_name)
+{
+	struct space *sp;
+	int rv = 0;
+
+	pthread_mutex_lock(&spaces_mutex);
+	sp = _search_space(space_name, NULL, 0, &spaces, NULL, NULL, NULL);
+	if (!sp)
+		rv = -ENOENT;
+	else
+		sp->rindex_op = 0;
+	pthread_mutex_unlock(&spaces_mutex);
+	return rv;
+}
+
 static int _clean_event_fds(struct space *sp)
 {
 	uint32_t end;
@@ -1492,7 +1663,7 @@ int lockspace_reg_event(struct sanlk_lockspace *ls, int fd, GNUC_UNUSED uint32_t
 	sp = _search_space(ls->name, NULL, 0, &spaces, NULL, NULL, NULL);
 	if (!sp) {
 		pthread_mutex_unlock(&spaces_mutex);
-		log_error("lockspace_reg_event %s not found", ls->name);
+		log_error("lockspace_reg_event %.48s not found", ls->name);
 		return -ENOENT;
 	}
 	pthread_mutex_unlock(&spaces_mutex);
@@ -1531,7 +1702,7 @@ int lockspace_set_event(struct sanlk_lockspace *ls, struct sanlk_host_event *he,
 	int i, rv = 0;
 
 	if (!ls->name[0] || !he->host_id || he->host_id > DEFAULT_MAX_HOSTS) {
-		log_error("set_event invalid args host_id %llu name %s",
+		log_error("set_event invalid args host_id %llu name %.48s",
 			  (unsigned long long)he->host_id, ls->name);
 		return -EINVAL;
 	}
@@ -1543,6 +1714,12 @@ int lockspace_set_event(struct sanlk_lockspace *ls, struct sanlk_host_event *he,
 		return -ENOENT;
 	}
 	pthread_mutex_unlock(&spaces_mutex);
+
+	if (he->host_id > sp->max_hosts) {
+		log_error("set_event host_id %llu too large max %u %s",
+			  (unsigned long long)he->host_id, sp->max_hosts, ls->name);
+		return -EINVAL;
+	}
 
 	if (!he->generation && (flags & SANLK_SETEV_CUR_GENERATION)) {
 		hs = &(sp->host_status[he->host_id-1]);
@@ -1572,8 +1749,7 @@ int lockspace_set_event(struct sanlk_lockspace *ls, struct sanlk_host_event *he,
 	if ((now - sp->set_event_time < sp->set_bitmap_seconds) &&
 	    sp->host_event.event && he->event &&
 	    (sp->host_event.event != he->event)) {
-		log_level(sp->space_id, 0, NULL, LOG_WARNING,
-			  "event %llu %llu %llu %llu replaced by %llu %llu %llu %llu t %llu",
+		log_warns(sp, "event %llu %llu %llu %llu replaced by %llu %llu %llu %llu t %llu",
 			  (unsigned long long)sp->host_event.host_id,
 			  (unsigned long long)sp->host_event.generation,
 			  (unsigned long long)sp->host_event.event,
@@ -1592,7 +1768,7 @@ set:
 	memcpy(&sp->host_event, he, sizeof(struct sanlk_host_event));
 
 	if (flags & SANLK_SETEV_ALL_HOSTS) {
-		for (i = 0; i < DEFAULT_MAX_HOSTS; i++)
+		for (i = 0; i < sp->max_hosts; i++)
 			sp->host_status[i].set_bit_time = now;
 	}
 out:
@@ -1682,6 +1858,78 @@ static int stop_lockspace_thread(struct space *sp, int wait)
 
 	return rv;
 }
+
+/*
+ * locking/lifetime rules for a struct space
+ *
+ * multiple factors:
+ * . spaces_mutex
+ * . sp->mutex
+ * . the specific thread: main daemon thread, lockspace thread, worker thread
+ *
+ * spaces, spaces_add, spaces_rem lists are protected by spaces_mutex
+ *
+ * sp->mutex protects info that is exchanged between the lockspace thread
+ * (for the sp) and the main thread.  This is primarily sp->thread_stop,
+ * and sp->lease_status (although it seems a couple other bits of info
+ * have been added over time that are communicated between the lockspace
+ * thread and the main thread).
+ *
+ * add_lockspace_start(), called by worker thread, creates sp,
+ * adds it to spaces_add list under spaces_mutex, creates lockspace_thread
+ * for the sp.
+ *
+ * lockspace_thread never has to worry about sp going away and can access
+ * sp directly any time.  The sp will not be freed until lockspace_thread
+ * has exited.
+ *
+ * The main thread never has to worry about sp going away, because the
+ * main thread is the only context in which sp structs are freed
+ * (and that only happens in free_lockspaces).
+ *
+ * add_lockspace_wait(), called by worker thread, can access sp directly
+ * because sp won't go away while it's on spaces_add.  Only add_lockspace_wait
+ * can do something with sp while it's on spaces_add.  _wait uses sp->mutex
+ * to exchange lease status with lockspace_thread.  Once the host_id lease
+ * is acquired, _wait moves sp from spaces_add to spaces under spaces_mutex.
+ * After sp is moved to spaces list, its lifetime is owned by the main thread.
+ *
+ * While sp is on spaces list, its lifetime is controlled by the main thread.
+ * Apart from lockspace_thread, any other thread, e.g. worker thread, must
+ * lock spaces_mutex, look up sp on spaces list, access sp fields, then unlock
+ * spaces_mutex.  After releasing spaces_mutex, it can't access sp struct
+ * because the main thread could dispose of it.  If the worker thread wants
+ * to look at info that's being updated by the lockspace_thread, it should
+ * also take sp->mutex before copying it.
+ *
+ * I currently see some violations of proper sp access that should be fixed.
+ * The bad pattern in each case is: lock spaces_mutex, find sp,
+ * unlock spaces_mutex, lock sp->mutex.  The sp could in theory go away between
+ * unlock spaces_mutex and lock sp->mutex.  (In practice this would
+ * likely never happen.)
+ *
+ * . worker_thread lockspace_set_event()
+ *   (reg_event and end_event are ok since they are called from
+ *   the main thread)
+ *
+ * . worker_thread host_status_set_bit() 
+ *
+ * . resource_thread send_event_callbacks() does the same.
+ *
+ * I'm not sure what the best solution would be: lock sp->mutex before
+ * unlocking spaces_mutex?  Do everything under spaces_mutex?  Add
+ * a simple ref count to sp for these cases of using sp from other
+ * threads?
+ *
+ * cmd_rem_lockspace() is run by a worker_thread.  rem_lockspace_start()
+ * locks spaces_mutex, finds sp, sets sp->external_remove, unlocks spaces_mutex.
+ * Then the main thread, which owns the sp structs, sees sp->external_remove,
+ * kills any pids using the sp, and when the sp is no longer used, it sets
+ * sp->thread_stop, and moves sp from spaces list to spaces_rem list.
+ * The main thread then runs free_lockspaces() which stops the lockspace_thread
+ * for sp's on spaces_rem.  When the lockspace_thread exits, the main thread
+ * then removes sp from spaces_rem and frees sp.
+ */
 
 void free_lockspaces(int wait)
 {

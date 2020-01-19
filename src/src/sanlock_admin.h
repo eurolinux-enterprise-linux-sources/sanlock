@@ -23,10 +23,6 @@
 /* write flags */
 #define SANLK_WRITE_CLEAR	0x00000001 /* subsequent read will return error */
 
-/* sanlk_lockspace.flags returned by get */
-#define SANLK_LSF_ADD		0x00000001
-#define SANLK_LSF_REM		0x00000002
-
 /* host status returned in low byte of sanlk_host.flags by get */
 #define SANLK_HOST_UNKNOWN 0x00000001
 #define SANLK_HOST_FREE    0x00000002
@@ -175,13 +171,63 @@ int sanlock_init(struct sanlk_lockspace *ls,
 		 int max_hosts, int num_hosts);
 
 /*
+ * Alignment and sector size
+ *
+ * The ALIGN and SECTOR flags can be set in sanlk_lockspace | sanlk_resource
+ * and passed to sanlock_write_lockspace() | sanlock_write_resource().
+ * These flags cause sanlock to create a lockspace|resource area with the
+ * given align_size, using the given sector_size.  The maximum hosts
+ * that can use a lockspace|resource is determined by the combined effect
+ * of ALIGN and SECTOR flags.  The following combinations are allowed:
+ *
+ * ALIGN1M | SECTOR512: max_hosts 2000
+ * ALIGN1M | SECTOR4K:  max_hosts 250
+ * ALIGN2M | SECTOR4K:  max_hosts 500
+ * ALIGN4M | SECTOR4K:  max_hosts 1000
+ * ALIGN8M | SECTOR4K:  max_hosts 2000
+ *
+ * ALIGN and SECTOR flags must both be set, or neither can be set.  When
+ * neither are set, sanlock will:
+ * - detect the sector_size of the disk and use 1M align_size if 512,
+ *   and 8M align_size for 4K.
+ * - use 512 sector_size and 8M align_size for files.
+ *
+ * sanlock_read_lockspace() | sanlock_read_resource() will return the
+ * ALIGN and SECTOR flags reflecting the state of the lockspace|resource.
+ * These flags are returned whether or not they were specified in
+ * sanlock_write_lockspace() | sanlock_write_resource().
+ * (The ALIGN flag can be passed to sanlock_read_lockspace() to avoid
+ * an extra read to discover the sector size.)
+ *
+ * Prior to the addition of ALIGN and SECTOR flags, sanlock will return
+ * neither flag from read.  The align_size of the lockspace | resource
+ * can then be determined with sanlock_align().  After the addition of
+ * these flags, sanlock_align() no longer correctly indicates the alignment
+ * of the lockspace | resource.
+ *
+ * With the addition of ALIGN and SECTOR flags, sanlock_align() still
+ * reports the *default* alignment that sanlock will use for disks or
+ * files if ALIGN|SECTOR is not passed to write.
+ *
+ * (A lockspace and its associated resources will typically use the
+ * same align and sector size, but it's conceivable they would not, e.g.
+ * if the were placed on different storage with different sector sizes.)
+ */
+
+/*
  * write a lockspace to disk
+ *
+ * Set SANLK_LSF_ALIGN and SANLK_LSF_SECTOR in ls.flags to define
+ * the sector size and align size of the lockspace on disk.  max_hosts
+ * is derived from these values (the max_hosts areg is not used.)
+ * It is best for resources in the lockspace to use these same
+ * sector/align sizes.
  *
  * the sanlock daemon writes max_hosts lockspace leader records to disk
  *
  * the lockspace will support up to max_hosts using the lockspace at once
  *
- * use max_hosts = 0 for default value
+ * valid host_id's for this lockspace are 1 to max_hosts.
  *
  * the first host_id (1) (the first record at offset) is the last
  * leader record written, so read_lockspace of host_id 1 will fail
@@ -220,11 +266,14 @@ int sanlock_read_lockspace(struct sanlk_lockspace *ls,
  *
  * the sanlock daemon writes a resource lease area to disk
  *
- * use max_hosts = 0 for default value
- * use num_hosts = 0 for default value
- *
  * Set flag SANLK_WRITE_CLEAR to cause a subsequent read_resource
  * to return an error.
+ *
+ * Set SANLK_RES_ALIGN and SANLK_RES_SECTOR in res.flags to define
+ * the sector size and align size of the resource on disk.  max_hosts
+ * is derived from these values (the max_hosts arg is not used.)
+ * It is best for the ALIGN and SECTOR flags to match those used
+ * for the resource's lockspace.
  */
 
 int sanlock_write_resource(struct sanlk_resource *res,
@@ -306,6 +355,119 @@ int sanlock_test_resource_owners(struct sanlk_resource *res, uint32_t flags,
 				 struct sanlk_host *owners, int owners_count,
 				 struct sanlk_host *hosts, int hosts_count,
 				 uint32_t *test_flags);
+
+/*
+ * A resource index stores the disk locations (offsets) of resource leases.
+ * Using it is optional; an application can keep track of lease offsets
+ * without using the index.
+ *
+ * On disk, a resource index uses two alignment-sized regions.
+ * The first holds the records mapping resource names to offsets.
+ * The second holds a paxos lease that sanlock uses internally
+ * to protect updates to the index.  The caller chooses the disk
+ * location of the resource index (path and offset), and passes
+ * this as a parameter to all functions that use the index with
+ * struct sanlk_rindex.
+ *
+ * The resource index is followed on disk by the resource leases
+ * that it references.  So, using the index removes the ability of
+ * the application to place resource leases at any disk location.
+ * A caller would usually place the resource index after a lockspace
+ * struct on disk (not required.)
+ *
+ * The resource index and the following resource leases must all use
+ * the same align size/flag.
+ *
+ * The rindex specifies the lockspace name that the referenced resource
+ * leases are associated with.  This lockspace will also be used for
+ * the internal rindex paxos lease.
+ * sanlock must be a member of the lockspace to use the create/delete
+ * resource functions.
+ *
+ * format
+ * ------
+ * Initializes resource index at the specified offset and
+ * initializes an internal paxos lease in the following area.
+ * Set the ALIGN flag in sanlk_rindex corresponding to the desired
+ * sector size; the align size used for the rindex must match the
+ * align size used for resources.
+ *
+ * lookup
+ * ------
+ * Looks up a value in the resource index.  When a res name is set
+ * and *offset is 0, this searches for an entry with the matching
+ * name and if found sets the res lease offset.  When res name is not
+ * set and an *offset is not 0, this checks for an entry with the given
+ * res lease offset and if found sets the res name.  When name and
+ * offset or both unset, the first free entry is returned in offset.
+ * All resource lease offsets are relative to the start of the device.
+ * sanlock does not acquire the internal rindex paxos lease.
+ * (The offsets are the disk locations of the resource leases, not
+ * the disk locations of the rindex entries for the resource leases.)
+ *
+ * update
+ * ------
+ * Add or remove an rindex entry.  When adding, the rentry
+ * name and offset must both be set, and the index entry is
+ * set to indicate the named resource lease exists at the
+ * specified offset.  WHen removing, the rentry offset needs
+ * to be set, and the index entry for that offset is cleared.
+ * This is not generally used; the create/delete interfaces are
+ * the standard method for updating the index.
+ *
+ * create_resource
+ * ---------------
+ * Searches the index for a free resource lease area, initializes a new
+ * resource lease at that offset, and updates the index for
+ * the new lease.  Returns the offset of the new resource lease.
+ * sanlock holds the internal rindex paxos lease around the index
+ * lookup, resource init and index update.  The new lease is initialized
+ * before the index is updated, so the index will not reference
+ * an uninitialized area if the host fails during create_resource.
+ *
+ * delete_resource
+ * ---------------
+ * Updates the index to remove the entry for the named resource lease,
+ * and clears the resource lease at that offset.
+ * sanlock holds the internal rindex paxos lease around the
+ * index update and lease reinitialization.  If sanlock fails
+ * after the index update but before clearing the resource, a
+ * subsequent create will overwrite the uncleared resource.
+ *
+ * rebuild
+ * -------
+ * Rebuilds the rindex based on resource leases that are found.
+ * Reads each potential resource lease area to check if a
+ * resource lease exists at that offset.  If so, an rindex
+ * entry is added with that resource name and offset.
+ */
+
+/*
+ * generic rindex flags use lower 16 bits
+ * specific rindex function function use upper 16 bits
+ */
+#define SANLK_RX_NO_LOCKSPACE   0x000000001  /* don't use the lockspace */
+
+/* update_rindex flags */
+#define SANLK_RXUP_ADD     0x00010000
+#define SANLK_RXUP_REM     0x00020000
+
+int sanlock_format_rindex(struct sanlk_rindex *rx, uint32_t flags);
+
+int sanlock_update_rindex(struct sanlk_rindex *rx, uint32_t flags,
+			  struct sanlk_rentry *re);
+
+int sanlock_lookup_rindex(struct sanlk_rindex *rx, uint32_t flags,
+			  struct sanlk_rentry *re);
+
+int sanlock_rebuild_rindex(struct sanlk_rindex *rx, uint32_t flags);
+
+int sanlock_create_resource(struct sanlk_rindex *rx, uint32_t flags,
+			    struct sanlk_rentry *re,
+			    int max_hosts, int num_hosts);
+
+int sanlock_delete_resource(struct sanlk_rindex *rx, uint32_t flags,
+			    struct sanlk_rentry *re);
 
 int sanlock_version(uint32_t flags, uint32_t *version, uint32_t *proto);
 

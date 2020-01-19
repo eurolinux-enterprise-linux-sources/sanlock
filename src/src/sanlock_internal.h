@@ -28,8 +28,10 @@
 #include "leader.h"
 #include "paxos_dblock.h"
 #include "mode_block.h"
+#include "rindex_disk.h"
 #include "list.h"
 #include "monotime.h"
+#include "sizeflags.h"
 
 #include <libaio.h>
 
@@ -42,6 +44,10 @@
 /* this is just the path to the executable, not full command line */
 
 #define COMMAND_MAX 4096
+
+#define SANLOCK_RUN_DIR "SANLOCK_RUN_DIR"
+#define DEFAULT_RUN_DIR "/var/run/sanlock"
+#define SANLOCK_PRIVILEGED "SANLOCK_PRIVILEGED"
 
 #define SANLK_LOG_DIR "/var/log"
 #define SANLK_LOGFILE_NAME "sanlock.log"
@@ -80,6 +86,7 @@ struct delta_extra {
 #define T_RESTRICT_SIGTERM	 0x00000002 /* inherited from client->restricted */
 #define T_RETRACT_PAXOS		 0x00000004
 #define T_WRITE_DBLOCK_MBLOCK_SH 0x00000008 /* make paxos layer include mb SHARED with dblock */
+#define T_CHECK_EXISTS		 0x00000010 /* make paxos layer not error if reading lease finds none */
 
 struct token {
 	/* values copied from acquire res arg */
@@ -91,6 +98,7 @@ struct token {
 	/* copied from the sp with r.lockspace_name */
 	uint64_t host_id;
 	uint64_t host_generation;
+	uint32_t space_id;
 	uint32_t io_timeout;
 
 	/* internal */
@@ -98,13 +106,22 @@ struct token {
 	struct resource *resource;
 	int pid;
 	uint32_t flags;  /* be careful to avoid using this from different threads */
-	uint32_t token_id; /* used to refer to this token instance in log messages */
+	uint32_t token_id;
+	uint32_t res_id;
+	int sector_size;
+	int align_size;
 	int space_dead; /* copied from sp->space_dead, set by main thread */
 	int shared_count; /* set during ballot by paxos_lease_acquire */
 	char shared_bitmap[HOSTID_BITMAP_SIZE]; /* bit set for host_id with SH */
 
 	struct sync_disk *disks; /* shorthand, points to r.disks[0] */
 	struct sanlk_resource r;
+	/*
+	 * sanlk_resource must be the last element of token.
+	 * sanlk_resource ends with sanlk_disk disks[0],
+	 * and allocating a token allocates N sanlk_disk structs
+	 * after the token struct so they follow the sanlk_resource.
+	 */
 };
 
 #define R_SHARED     		0x00000001
@@ -123,8 +140,11 @@ struct resource {
 	uint64_t host_generation;
 	uint32_t io_timeout;
 	int pid;                     /* copied from token when ex */
+	int sector_size;
+	int align_size;
+	uint32_t res_id;
+	uint32_t reused;
 	uint32_t flags;
-	uint32_t release_token_id;   /* copy to temp token (tt) for log messages */
 	uint64_t thread_release_retry;
 	char *lvb;
 	char killpath[SANLK_HELPER_PATH_LEN]; /* copied from client */
@@ -188,7 +208,10 @@ struct space {
 	uint32_t flags; /* SP_ */
 	uint32_t used_retries;
 	uint32_t renewal_read_extend_sec; /* defaults to io_timeout */
+	uint32_t rindex_op;
+	int sector_size;
 	int align_size;
+	int max_hosts;
 	int renew_fail;
 	int space_dead;
 	int killing_pids;
@@ -216,8 +239,17 @@ struct space_info {
 	uint32_t io_timeout;
 	uint64_t host_id;
 	uint64_t host_generation;
+	int sector_size;
+	int align_size;
 	int killing_pids;
 };
+
+#define RX_OP_FORMAT 1
+#define RX_OP_CREATE 2
+#define RX_OP_DELETE 3
+#define RX_OP_LOOKUP 4
+#define RX_OP_UPDATE 5
+#define RX_OP_REBUILD 6
 
 #define HOSTID_AIO_CB_SIZE 4
 #define WORKER_AIO_CB_SIZE 2
@@ -298,17 +330,27 @@ EXTERN struct client *client;
 #define DEFAULT_QUIET_FAIL 1
 #define DEFAULT_RENEWAL_HISTORY_SIZE 180 /* about 1 hour with 20 sec renewal interval */
 
+#define DEFAULT_MAX_SECTORS_KB_IGNORE 0     /* don't change it */
+#define DEFAULT_MAX_SECTORS_KB_ALIGN  0     /* set it to align size */
+#define DEFAULT_MAX_SECTORS_KB_NUM    1024  /* set it to num KB for all lockspaces */
+
 struct command_line {
 	int type;				/* COM_ */
 	int action;				/* ACT_ */
 	int debug;
 	int debug_renew;
-	int quiet_fail;
+	int debug_io_submit;
+	int debug_io_complete;
 	int paxos_debug_all;
+	int max_sectors_kb_ignore;
+	int max_sectors_kb_align;
+	int max_sectors_kb_num;
+	int quiet_fail;
 	int wait;
 	int use_watchdog;
 	int high_priority;		/* -h */
 	int get_hosts;			/* -h */
+	int names_log_priority;
 	int mlock_level;
 	int max_worker_threads;
 	int aio_arg;
@@ -321,6 +363,8 @@ struct command_line {
 	int used;
 	int all;
 	int clear_arg;
+	int sector_size;
+	int align_size;
 	char *uname;			/* -U */
 	int uid;				/* -U */
 	char *gname;			/* -G */
@@ -342,6 +386,9 @@ struct command_line {
 	char our_host_name[SANLK_NAME_LEN+1];
 	char *file_path;
 	char *dump_path;
+	int rindex_op;
+	struct sanlk_rentry rentry;		/* -e */
+	struct sanlk_rindex rindex;		/* -x RINDEX */
 	struct sanlk_lockspace lockspace;	/* -s LOCKSPACE */
 	struct sanlk_resource *res_args[SANLK_MAX_RESOURCES]; /* -r RESOURCE */
 };
@@ -385,6 +432,12 @@ enum {
 	ACT_SET_CONFIG,
 	ACT_WRITE_LEADER,
 	ACT_RENEWAL,
+	ACT_FORMAT,
+	ACT_CREATE,
+	ACT_DELETE,
+	ACT_LOOKUP,
+	ACT_UPDATE,
+	ACT_REBUILD,
 };
 
 EXTERN int external_shutdown;

@@ -9,11 +9,17 @@
 #ifndef __DISKIO_H__
 #define __DISKIO_H__
 
+void offset_to_str(unsigned long long offset, int buflen, char *off_str);
+
 void close_disks(struct sync_disk *disks, int num_disks);
 int open_disk(struct sync_disk *disks);
 int open_disks(struct sync_disk *disks, int num_disks);
 int open_disks_fd(struct sync_disk *disks, int num_disks);
 int majority_disks(int num_disks, int num);
+
+int read_sysfs_size(const char *path, const char *name, unsigned int *val);
+int set_max_sectors_kb(struct sync_disk *disk, uint32_t max_sectors_kb);
+int get_max_sectors_kb(struct sync_disk *disk, uint32_t *max_sectors_kb);
 
 /*
  * iobuf functions require the caller to allocate iobuf using posix_memalign
@@ -34,17 +40,17 @@ int read_iobuf_reap(int fd, uint64_t offset, char *iobuf, int iobuf_len,
  * for io, copy out of it for write, and free it
  */
 
-int write_sector(const struct sync_disk *disk, uint64_t sector_nr,
+int write_sector(const struct sync_disk *disk, int sector_size, uint64_t sector_nr,
 		 const char *data, int data_len,
 		 struct task *task, int ioto,
 		 const char *blktype);
 
-int write_sectors(const struct sync_disk *disk, uint64_t sector_nr,
+int write_sectors(const struct sync_disk *disk, int sector_size, uint64_t sector_nr,
 		  uint32_t sector_count, const char *data, int data_len,
 		  struct task *task, int ioto,
 		  const char *blktype);
 
-int read_sectors(const struct sync_disk *disk, uint64_t sector_nr,
+int read_sectors(const struct sync_disk *disk, int sector_size, uint64_t sector_nr,
 	 	 uint32_t sector_count, char *data, int data_len,
 		 struct task *task, int ioto,
 		 const char *blktype);
