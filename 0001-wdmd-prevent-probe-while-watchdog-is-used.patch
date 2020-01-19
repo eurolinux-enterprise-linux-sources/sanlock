@@ -1,0 +1,51 @@
+From 7e43623a8ccf59411e4a43d5aff48d9326fbed26 Mon Sep 17 00:00:00 2001
+From: David Teigland <teigland@redhat.com>
+Date: Wed, 18 Nov 2015 13:50:21 -0600
+Subject: [PATCH] wdmd: prevent probe while watchdog is used
+
+If the wdmd daemon is killed uncleanly, /dev/watchdog
+is closed uncleanly and the watchdog should fire to
+reset the machine.
+
+If 'wdmd -p' is run to probe available watchdog devices
+after wdmd is killed and before the machine is reset,
+it will unintentionally interfere with the expiring
+watchdog by doing open/magic-close on each device.
+This silently prevents the watchdog from firing when
+it should.
+
+The probe function can check for the shm flag before
+touching any watchdog devices, just like another wdmd
+daemon process does, to avoid interfering with the
+watchdog state of a previous wdmd daemon that was
+terminated uncleanly.
+---
+ wdmd/main.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/wdmd/main.c b/wdmd/main.c
+index c29667f4a10b..911d8330e84e 100644
+--- a/wdmd/main.c
++++ b/wdmd/main.c
+@@ -1604,7 +1604,18 @@ int main(int argc, char *argv[])
+ 	}
+ 
+ 	if (do_probe) {
++		rv = setup_shm();
++		if (rv < 0) {
++			fprintf(stderr, "cannot probe watchdog devices while wdmd is in use.\n");
++			openlog("wdmd-probe", LOG_CONS | LOG_PID, LOG_DAEMON);
++			syslog(LOG_ERR, "cannot probe watchdog devices while wdmd is in use.\n");
++			exit(EXIT_FAILURE);
++		}
++
+ 		rv = probe_watchdog();
++
++		close_shm();
++
+ 		if (rv < 0)
+ 			exit(EXIT_FAILURE);
+ 		else
+-- 
+1.8.3.1
+
